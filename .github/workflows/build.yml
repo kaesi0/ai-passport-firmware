@@ -1,0 +1,113 @@
+name: Build AI Passport custom firmware
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 发布 Release 需要写权限；缺了会在最后一步 403
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 5 patches)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+    env:
+      UPSTREAM_REPO: https://github.com/78/xiaozhi-esp32.git
+      # 必须是完整 40 位 SHA：短 SHA 实测 fetch 失败（couldn't find remote ref）
+      UPSTREAM_SHA: 0d576d3d4c049c6f55eaf879725dc23e516511b4
+      BOARD: folotoy/ai-passport
+      BOARD_NAME: ai-passport
+    steps:
+      - name: Checkout build recipe
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Clone upstream at pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p src && cd src
+          git init -q .
+          git remote add origin "$UPSTREAM_REPO"
+          git fetch --depth 1 origin "$UPSTREAM_SHA"
+          git checkout -q FETCH_HEAD
+          echo "基线 commit：$(git log --oneline -1)"
+
+      - name: Apply patches (must keep order)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 字典序即 0001 → 0005，顺序不能乱（0002 依赖 0001，0004 依赖 0003）
+          for p in ../recipe/patches/*.patch; do
+            echo ">>> $(basename "$p")"
+            if git am --keep-cr=false "$p"; then
+              echo "    applied via git am"
+            else
+              git am --abort || true
+              git apply -v "$p"
+              echo "    applied via git apply"
+            fi
+          done
+          echo "===== 累计变更（对基线）====="
+          # 用 FETCH_HEAD 而不是 HEAD~N：不依赖打了几个补丁，加/减补丁都不用改这里
+          git diff --shortstat FETCH_HEAD
+
+      - name: Sanity checks before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          echo "===== PROJECT_VER（须为 9.9.9，否则会被官方 OTA 覆盖）====="
+          grep -n 'PROJECT_VER' CMakeLists.txt | head -2
+          grep -q 'set(PROJECT_VER "9.9.9")' CMakeLists.txt || {
+            echo "::error::PROJECT_VER 未抬高，固件会被官方 OTA 覆盖"; exit 1; }
+          echo "===== 新增 MCP 工具（应列出 3 个）====="
+          grep -oE '"self\.(audio|screen)\.[a-z_]+"' \
+            main/boards/folotoy/ai-passport/ai_passport_board.cc | sort -u
+          echo "===== 板型仍被构建脚本识别 ====="
+          python scripts/build.py --list-boards | grep -i ai-passport
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          source "$IDF_PATH/export.sh"
+          python scripts/build.py "$BOARD" --name "$BOARD_NAME"
+
+      - name: Verify output
+        shell: bash
+        run: |
+          cd src
+          ls -la build/merged-binary.bin
+          du -h build/merged-binary.bin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi-ai-passport-custom-${{ github.sha }}
+          path: src/build/merged-binary.bin
+          if-no-files-found: error
+
+      - name: Publish release asset
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fw-${{ github.run_number }}
+          name: AI Passport custom firmware #${{ github.run_number }}
+          body: |
+            基线：78/xiaozhi-esp32 @ main 0d576d3
+            补丁：0001~0005（含 PROJECT_VER 抬到 9.9.9）
+            提交：${{ github.sha }}
+            工具：self.audio.play_url / self.screen.show_image / self.screen.hide_image
+            烧录：见 README；起始地址 0x0，烧录后 NVS 被清空，需重新配网
+          files: src/build/merged-binary.bin
