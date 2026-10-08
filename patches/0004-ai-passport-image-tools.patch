@@ -1,0 +1,396 @@
+From 98c1b18a0a0fc72314007c7d02717422caac3c86 Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Tue, 6 Oct 2026 21:10:29 +0800
+Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E6=96=B0=E5=A2=9E?=
+ =?UTF-8?q?=E6=9D=BF=E7=BA=A7=E5=85=A8=E5=B1=8F=E7=9C=8B=E5=9B=BE=E5=B7=A5?=
+ =?UTF-8?q?=E5=85=B7=20self.screen.show=5Fimage=20/=20hide=5Fimage?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+适用基线：78/xiaozhi-esp32 main @ 0d576d3（同样适用于 v2.5.0）
+
+为什么不直接用内建的 self.screen.preview_image：
+  1) 它是 AddUserOnlyTool —— 模型在 tools/list 里看不到（除非服务端带
+     withUserTools:true），典型症状是"模型念得出图片网址、屏幕却没反应"；
+  2) 它 5 秒后自动消失（PREVIEW_IMAGE_DURATION_MS），且只占屏幕约一半。
+本补丁用 AddTool 注册（模型可见），显示交给上一提交的常驻全屏图片层。
+
+- 解码分两级
+    第一级 LVGL 解码器：本固件只启用了 CONFIG_LV_USE_LODEPNG=y，覆盖 PNG/BMP；
+    第二级 jpeg_to_image()：固件的 esp_new_jpeg 封装，输出 RGB565，覆盖 JPEG。
+  第二级不是可选优化——本固件 LVGL 没开 JPEG 解码器（LV_USE_TJPGD / LV_USE_SJPG
+  均未启用），而多数生图服务默认返回 JPEG。
+
+- 内存红线（本板 ESP32-C3，8MB Flash，无 PSRAM，240x320 ST7789）
+    下载缓冲上限 128KB；解码像素量上限 120KB（约 240x256 RGB565）。
+    屏满幅 RGB565 是 150KB，已超过本板通常可用的整块堆，因此刻意压低。
+
+    两处尺寸检查都刻意放在"分配之前"：
+      * JPEG：新增 GetJpegSize() 先扫 SOF marker 拿到宽高，超限立刻返回错误。
+        因为 jpeg_to_image() 是整幅解码（一次性申请 宽x高x2），等它返回再判，
+        超限图早把堆撑爆了，拿不到这段错误句子而是直接 OOM。
+      * PNG：先用 lv_image_decoder_get_info() 拿到宽高再构造 LvglAllocatedImage。
+
+- 用户出口
+    任意机身键（UP/DOWN/OK）的 OnClick 里先尝试关图：按键回调在按键任务上，
+    LVGL 只能在主任务动，因此只做一次无锁可见性判断，隐藏动作经
+    Application::Schedule 回主任务（与本文件其它按键处理一致）。
+    另有 self.screen.hide_image 供语音"关掉图片"使用。
+
+review 修复（相对初版）：
+  1) 尺寸检查时序：JPEG 分支原本在 jpeg_to_image() 返回后才判超限，与本补丁
+     声称的"卡在分配之前"不符。新增 GetJpegSize() 前置预判。
+  2) probe.header.magic 未设置：LVGL 用 magic 区分"内存 lv_image_dsc_t"与
+     "文件路径字符串"（lv_image_src_get_type）。原实现依赖 magic=0 时的 LVGL
+     内部判定，一旦被当成路径，PNG 会误落到 JPEG 分支并彻底失败。现显式设
+     LV_IMAGE_HEADER_MAGIC。
+  3) 缺 IsValid()：官方 preview_image（mcp_server.cc:307）在构造后必查有效性，
+     原实现没有。坏图会一路走到 ShowFullscreenImage 才被拒，且错误被误导成
+     "屏幕不支持全屏图片"。
+---
+ .../folotoy/ai-passport/ai_passport_board.cc  | 289 ++++++++++++++++++
+ 1 file changed, 289 insertions(+)
+
+diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+index 766b6be..f0815f8 100644
+--- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
++++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+@@ -5,10 +5,13 @@
+ #include "button.h"
+ #include "config.h"
+ #include "mcp_server.h"
++#include "lvgl_display/lvgl_image.h"
++#include "jpg/jpeg_to_image.h"
+ #include "assets/lang_config.h"
+ #include "cw2017_battery_monitor.h"
+ #include "power_save_timer.h"
+ 
++#include <esp_heap_caps.h>
+ #include <esp_log.h>
+ #include <esp_lcd_panel_vendor.h>
+ #include <esp_lcd_panel_ops.h>
+@@ -416,6 +419,9 @@ private:
+         auto up = adc_button_[kAdcButtonUp];
+         up->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [本地补丁] 全屏图片占着屏幕时，任意键先用来关掉它。
++            // 否则用户看不到对话界面，按键也失去了"当前状态"的参照。
++            if (DismissFullscreenImage()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
+         });
+         up->OnLongPress([this]() {
+@@ -429,6 +435,8 @@ private:
+         auto down = adc_button_[kAdcButtonDown];
+         down->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [本地补丁] 同上：先关全屏图片。
++            if (DismissFullscreenImage()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
+         });
+         down->OnLongPress([this]() {
+@@ -442,6 +450,8 @@ private:
+         auto ok = adc_button_[kAdcButtonOk];
+         ok->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [本地补丁] 同上：先关全屏图片，不要直接进对话。
++            if (DismissFullscreenImage()) return;
+             Application::GetInstance().Schedule([this]() {
+                 // Opening the audio channel with the network down would only
+                 // raise an error alert, so show the ordinary "connecting" hint
+@@ -1053,6 +1063,248 @@ public:
+     // 采样率必须对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000），
+     // 否则 OpusHead 里写的是别的速率，固件需要额外重采样，听感会变慢或变快。
+     // -----------------------------------------------------------------------
++    // -----------------------------------------------------------------------
++    // [本地补丁] 若全屏图片正在显示，就关掉它并返回 true。
++    //
++    // 按键回调跑在按键任务上，而 LVGL 只能在主任务里动，因此这里只做一次
++    // 无锁的可见性判断，真正的隐藏交给 Application::Schedule 回主任务执行
++    // （与本文件其它按键处理完全一致）。
++    // -----------------------------------------------------------------------
++    bool DismissFullscreenImage() {
++        if (display_ == nullptr || !display_->IsFullscreenImageVisible()) {
++            return false;
++        }
++        Application::GetInstance().Schedule([this]() { display_->HideFullscreenImage(); });
++        return true;
++    }
++
++    // -----------------------------------------------------------------------
++    // [本地补丁] 下载并全屏显示一张网络图片
++    //
++    // 和内建的 self.screen.preview_image 相比，两处关键差别决定了必须自建：
++    //   1) 那个工具是 AddUserOnlyTool，模型在 tools/list 里看不到，于是典型症状是
++    //      "模型念得出图片网址、屏幕却没反应"；本工具用 AddTool 注册，模型可见。
++    //   2) 它显示 5 秒后自动消失，且只占屏幕约一半；本板全屏常驻，直到显式隐藏。
++    //
++    // 解码分两级：先交给 LVGL 解码器（本固件只启用了 PNG），不行再用固件自带的
++    // jpeg_to_image()（esp_new_jpeg，输出 RGB565）兜底。第二级不是可选优化——
++    // 本固件的 LVGL 没开 JPEG 解码器（sdkconfig 里只有 CONFIG_LV_USE_LODEPNG=y，
++    // LV_USE_TJPGD / LV_USE_SJPG 均未启用），而多数生图服务默认返回 JPEG。
++    //
++    // 内存红线（本板 ESP32-C3，8MB Flash，**无 PSRAM**）：
++    //   - 下载缓冲上限 128KB。别的板子（如带 PSRAM 的 S3）敢放到 1MB，这里不行；
++    //   - 解码后像素量上限 120KB（≈240x256 RGB565）。屏是 240x320，满屏 RGB565
++    //     要 150KB，已经吃掉了本板通常可用的整块堆，所以刻意压在 120KB。
++    //   超限一律明确报错，而不是硬撑到 OOM——设备是真的显示不了。
++    // -----------------------------------------------------------------------
++    // -----------------------------------------------------------------------
++    // [本地补丁] 只从 JPEG 字节流里读出宽高，不解码。
++    //
++    // 存在的理由：jpeg_to_image() 是**整幅解码**——它一次性分配 宽×高×2 字节的
++    // RGB565 缓冲（jpeg_to_image.h:20-23），没有流式选项。本板没有 PSRAM，一张
++    // 超限图会在它返回之前就把堆撑爆，我们连"优雅地拒绝"都做不到，只会 OOM。
++    // 所以要先扫 SOF marker 拿到尺寸，超限直接返回错误。
++    //
++    // JPEG 结构：SOI(FFD8) 之后是一串 FFxx + 长度(2B,大端) 的段；SOF0/1/2
++    // （FFC0~FFCF，排除定义 Huffman 表/算术编码的 C4/C8/CC）里紧跟着
++    // 精度(1B)、高度(2B)、宽度(2B)。
++    // -----------------------------------------------------------------------
++    static bool GetJpegSize(const uint8_t* data, size_t len, int* width, int* height) {
++        if (data == nullptr || len < 4 || data[0] != 0xFF || data[1] != 0xD8) {
++            return false;  // 不是 JPEG（或太短）
++        }
++        size_t p = 2;
++        while (p + 3 < len) {
++            if (data[p] != 0xFF) {  // 填充字节，跳过
++                ++p;
++                continue;
++            }
++            const uint8_t marker = data[p + 1];
++            if (marker == 0xFF) {  // 连续 FF 是填充，前进一格重试
++                ++p;
++                continue;
++            }
++            if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
++                p += 2;  // 无长度字段的独立标记
++                continue;
++            }
++            if (marker == 0xD9) {  // EOI：走到结尾也没见到 SOF
++                return false;
++            }
++            const size_t seg_len = (static_cast<size_t>(data[p + 2]) << 8) | data[p + 3];
++            const bool is_sof = (marker >= 0xC0 && marker <= 0xCF) && marker != 0xC4 &&
++                                marker != 0xC8 && marker != 0xCC;
++            if (is_sof) {
++                if (p + 9 >= len) {
++                    return false;
++                }
++                *height = (static_cast<int>(data[p + 5]) << 8) | data[p + 6];
++                *width = (static_cast<int>(data[p + 7]) << 8) | data[p + 8];
++                return *width > 0 && *height > 0;
++            }
++            if (seg_len == 0) {
++                return false;  // 长度为 0 会死循环
++            }
++            p += 2 + seg_len;
++        }
++        return false;
++    }
++
++    ToolResult ShowImageFromUrl(const std::string& url) {
++        if (url.empty()) {
++            return std::unexpected("url 不能为空");
++        }
++        if (display_ == nullptr) {
++            return std::unexpected("本设备没有可用的屏幕");
++        }
++
++        // 官方 preview_image 用的是 3 秒超时，公网图片（尤其首次 TLS 握手）常常不够，
++        // 这里放宽到 15 秒。
++        auto http = Board::GetInstance().GetNetwork()->CreateHttp(15);
++        if (http == nullptr) {
++            return std::unexpected("Failed to create HTTP client");
++        }
++        if (auto opened = http->Open("GET", url); !opened) {
++            return std::unexpected("Failed to open URL: " + url + " (" +
++                                   opened.error().ToString() + ")");
++        }
++        auto status_code = http->GetStatusCode();
++        if (!status_code) {
++            http->Close();
++            return std::unexpected(status_code.error().ToString());
++        }
++        if (*status_code != 200) {
++            http->Close();
++            return std::unexpected("Unexpected status code: " + std::to_string(*status_code));
++        }
++
++        const size_t content_length = http->GetBodyLength();
++        constexpr size_t kMaxDownloadBytes = 128 * 1024;
++        if (content_length == 0 || content_length > kMaxDownloadBytes) {
++            http->Close();
++            return std::unexpected("Image size not acceptable: " +
++                                   std::to_string(content_length) +
++                                   " bytes (must be 1..131072)");
++        }
++
++        using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
++        BufferPtr data(
++            static_cast<char*>(heap_caps_malloc(content_length, MALLOC_CAP_8BIT)),
++            heap_caps_free);
++        if (data == nullptr) {
++            http->Close();
++            return std::unexpected("Out of memory for image download");
++        }
++        size_t total_read = 0;
++        while (total_read < content_length) {
++            auto ret = http->Read(data.get() + total_read, content_length - total_read);
++            if (!ret) {
++                http->Close();
++                return std::unexpected("Failed to download image");
++            }
++            if (*ret == 0) {
++                break;
++            }
++            total_read += *ret;
++        }
++        http->Close();
++
++        constexpr size_t kMaxDecodedBytes = 120 * 1024;
++        std::unique_ptr<LvglImage> image;
++        const char* decoder_used = "none";
++
++        // ---- 第一级：LVGL 解码器（本固件为 PNG）----
++        {
++            lv_image_dsc_t probe = {};
++            probe.data_size = total_read;
++            probe.data = reinterpret_cast<uint8_t*>(data.get());
++            // magic 必须显式设成 LV_IMAGE_HEADER_MAGIC：LVGL 靠它区分「这是一块
++            // lv_image_dsc_t」还是「这是一个文件路径字符串」（lv_image_src_get_type）。
++            // 不设的话 magic=0，判定结果就取决于 LVGL 内部实现，等于把自己的命运
++            // 交给别人；一旦被当成文件路径处理，PNG 会误落到下面的 JPEG 分支彻底失败。
++            probe.header.magic = LV_IMAGE_HEADER_MAGIC;
++            lv_image_header_t header = {};
++            if (lv_image_decoder_get_info(&probe, &header) == LV_RESULT_OK) {
++                if (header.w == 0 || header.h == 0) {
++                    return std::unexpected("Downloaded image is invalid (bad header)");
++                }
++                const size_t decoded = static_cast<size_t>(header.w) * header.h * 2;
++                if (decoded > kMaxDecodedBytes) {
++                    return std::unexpected("Image too large for this device: " +
++                                           std::to_string(header.w) + "x" +
++                                           std::to_string(header.h) +
++                                           " (max about 240x256, this board has no PSRAM)");
++                }
++                image = std::make_unique<LvglAllocatedImage>(data.release(), total_read);
++                // IsValid() 是官方 preview_image 的做法（mcp_server.cc:307）：
++                // 构造只填 dsc、不判内容，合法性必须自己查。缺了它，坏图会一路走
++                // 到 ShowFullscreenImage 才被拒，返回的错误还误导成「屏幕不支持」。
++                if (!image->IsValid()) {
++                    return std::unexpected("Downloaded image is invalid: " + url);
++                }
++                decoder_used = "lvgl";
++            }
++        }
++
++        // ---- 第二级：固件自带的 JPEG 解码器（输出 RGB565）----
++        if (image == nullptr) {
++            // 尺寸必须**在解码之前**拦下一道。jpeg_to_image() 会一次性申请
++            // 宽×高×2 的整幅缓冲，本板没有 PSRAM，等它把内存申请完再拒绝，
++            // 就已经晚了（结果多半不是这段错误句子，而是直接 OOM）。
++            int pre_w = 0;
++            int pre_h = 0;
++            if (GetJpegSize(reinterpret_cast<const uint8_t*>(data.get()), total_read,
++                            &pre_w, &pre_h)) {
++                const size_t would_be = static_cast<size_t>(pre_w) * pre_h * 2;
++                if (would_be > kMaxDecodedBytes) {
++                    return std::unexpected("Image too large for this device: " +
++                                           std::to_string(pre_w) + "x" +
++                                           std::to_string(pre_h) +
++                                           " (max about 240x256, this board has no PSRAM)");
++                }
++            }
++            // 读不出尺寸（渐进式 JPEG 或数据损坏）时不拦，交给解码器去判——
++            // 乱拦会把本来能显示的图误报成「太大」。
++
++            uint8_t* rgb = nullptr;
++            size_t rgb_len = 0;
++            size_t jw = 0;
++            size_t jh = 0;
++            size_t stride = 0;
++            const esp_err_t jerr = jpeg_to_image(reinterpret_cast<const uint8_t*>(data.get()),
++                                                 total_read, &rgb, &rgb_len, &jw, &jh, &stride);
++            if (jerr != ESP_OK || rgb == nullptr) {
++                return std::unexpected("Unsupported or undecodable image "
++                                       "(this firmware can decode PNG and JPEG only)");
++            }
++            // 解码后按实际 stride 再核一遍：硬件解码器会把边长对齐到 16 字节，
++            // 实际缓冲可能比 宽×高×2 更大（jpeg_to_image.h:49-52）。
++            if (jw == 0 || jh == 0 || rgb_len > kMaxDecodedBytes) {
++                heap_caps_free(rgb);
++                return std::unexpected("Image too large for this device: " + std::to_string(jw) +
++                                       "x" + std::to_string(jh) + ", but buffer is " +
++                                       std::to_string(rgb_len) +
++                                       " bytes (max 122880, this board has no PSRAM)");
++            }
++            data.reset();  // 压缩数据已无用，解码结果另占一块内存
++            ESP_LOGI(TAG, "JPEG decoded to RGB565: %ux%u stride=%u len=%u",
++                     static_cast<unsigned>(jw), static_cast<unsigned>(jh),
++                     static_cast<unsigned>(stride), static_cast<unsigned>(rgb_len));
++            image = std::make_unique<LvglAllocatedImage>(rgb, rgb_len, static_cast<int>(jw),
++                                                         static_cast<int>(jh),
++                                                         static_cast<int>(stride),
++                                                         LV_COLOR_FORMAT_RGB565);
++            decoder_used = "jpeg_to_image";
++        }
++
++        if (image == nullptr || !display_->ShowFullscreenImage(std::move(image))) {
++            return std::unexpected("Display does not support fullscreen image");
++        }
++        ESP_LOGI(TAG, "Image shown fullscreen via %s: %u bytes from %s", decoder_used,
++                 static_cast<unsigned>(total_read), url.c_str());
++        return std::string("图片已全屏显示在设备屏幕上");
++    }
++
+     void InitializeTools() {
+         auto& mcp_server = McpServer::GetInstance();
+         mcp_server.AddTool(
+@@ -1073,6 +1325,43 @@ public:
+                 }
+                 return std::string("已开始播放音频");
+             });
++
++        // -------------------------------------------------------------------
++        // [本地补丁] 新增工具：全屏看图
++        //
++        // 为什么不用官方的 self.screen.preview_image：
++        //   1) 它是 AddUserOnlyTool —— 模型在 tools/list 里看不到，典型症状是
++        //      "模型念得出图片网址、屏幕却没反应"；
++        //   2) 它 5 秒后自动消失，且只占屏幕约一半。
++        // 这里用 AddTool（模型可见），显示交给 display 侧常驻的全屏图层。
++        //
++        // 格式：PNG 走 LVGL 解码器；JPEG 走固件自带的 jpeg_to_image()。
++        // 内存：本板无 PSRAM，图片必须小（见工具描述与 ShowImageFromUrl 注释）。
++        // -------------------------------------------------------------------
++        mcp_server.AddTool(
++            "self.screen.show_image",
++            "把一张图片全屏显示在设备的 240x320 屏幕上。图片会一直显示，"
++            "直到调用 self.screen.hide_image，或者用户按机身任意键。"
++            "适合画图、展示照片、显示图表等需要用户『亲眼看到』的内容。"
++            "url 必须是设备能直接下载的图片直链（jpg / png）。"
++            "重要：图片尺寸要控制在 240x320 以内、越小越稳——"
++            "本设备没有 PSRAM，图太大内存不够，会直接返回错误而显示不出来。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                return ShowImageFromUrl(properties["url"].value<std::string>());
++            });
++
++        mcp_server.AddTool("self.screen.hide_image",
++                           "关闭屏幕上的全屏图片，回到正常的对话界面。"
++                           "用户说『关掉图片』『不看了』『回到界面』时调用。",
++                           PropertyList(), [this](const PropertyList&) -> ToolResult {
++                               if (display_ == nullptr ||
++                                   !display_->IsFullscreenImageVisible()) {
++                                   return std::string("屏幕当前没有全屏图片");
++                               }
++                               display_->HideFullscreenImage();
++                               return std::string("已关闭全屏图片");
++                           });
+     }
+ 
+     virtual AudioCodec* GetAudioCodec() override {
+-- 
+2.50.1 (Apple Git-155)
+

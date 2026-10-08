@@ -1,0 +1,103 @@
+From 807474c3ace59556da0d3dc82dce4b4cc0d19847 Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Tue, 6 Oct 2026 21:11:52 +0800
+Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E6=96=B0=E5=A2=9E?=
+ =?UTF-8?q?=E6=9D=BF=E7=BA=A7=E7=BD=91=E7=BB=9C=E9=9F=B3=E9=A2=91=E6=92=AD?=
+ =?UTF-8?q?=E6=8A=A5=E5=B7=A5=E5=85=B7=20self.audio.play=5Furl?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+适用基线：78/xiaozhi-esp32 main @ 0d576d3（不得低于 af55a78，否则板级
+三阶段省电策略尚不存在，电池穿戴设备会持续耗电）。
+
+前置补丁：0001（board-agnostic 的 Application::PlayAudioUrl）。
+
+固件里不存在任何「播某个 URL」的全局工具（全仓 grep play_url 命中 0），
+官方的 notify 入口只接受服务端下发的控制报文，而且它的首行门禁要求设备
+处于 Idle —— MCP 工具被调用时设备必然在 Listening/Speaking，因此即便
+硬调 StartNotification 也会被静默丢弃。所以只能在板级补，并靠 0001 提供的
+PlayAudioUrl 做状态腾挪。
+
+板级改动只有三处：
+  1) #include "mcp_server.h"；
+  2) InitializeTools()：注册 AddTool 工具 self.audio.play_url，回调里调
+     Application::GetInstance().PlayAudioUrl(url)；
+  3) 在构造函数 InitializeButtons() 之后调用 InitializeTools()——
+     工具必须在 MCPServer 建立之后、设备开始对话之前注册。
+
+音频约束（由 NotifyPlayer + OggDemuxer 决定，与官方 notify 完全一致），
+已写进工具描述，因为格式不符时设备不报错、只是完全没有声音：
+  - Ogg Opus 单声道，采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000）；
+  - 逻辑包 <= 2048 字节、包长 <= 120ms；不跟重定向；仅接受 2xx；
+  - 固件无 MP3 解码器，立体声会被直接中止（不降混）。
+---
+ .../folotoy/ai-passport/ai_passport_board.cc  | 41 +++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+index cfe0e68..766b6be 100644
+--- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
++++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+@@ -4,6 +4,7 @@
+ #include "application.h"
+ #include "button.h"
+ #include "config.h"
++#include "mcp_server.h"
+ #include "assets/lang_config.h"
+ #include "cw2017_battery_monitor.h"
+ #include "power_save_timer.h"
+@@ -1030,10 +1031,50 @@ public:
+         InitializeSpi();
+         InitializeDisplay();
+         InitializeButtons();
++        // [本地补丁] 工具必须在 MCPServer 建立之后、设备开始对话之前注册，
++        // 因此放在构造流程里（与其它板子的 InitializeTools 时机一致）。
++        InitializeTools();
+         GetBacklight()->RestoreBrightness();
+         InitializePowerSaveTimer();
+     }
+ 
++    // -----------------------------------------------------------------------
++    // [本地补丁] 板级 MCP 工具：网络音频播报
++    //
++    // 复用固件自带的 NotifyPlayer（main/notify/notify_player.cc）：
++    //   HTTP 拉取 -> Ogg 解封装 -> 推入 Opus 解码队列。
++    // 与官方 notify 控制报文走同一条管线，只是触发方式从「服务端下发控制报文」
++    // 改为「模型调用本工具」，因此音频格式约束与 notify 完全一致，必须写进工具
++    // 描述——格式不符时设备不会报错，只是完全没有声音（先响一声提示音再静默）。
++    //
++    // 固件里不存在任何「播某个 URL」的全局工具（全仓 grep play_url 命中 0），
++    // 官方的 notify 入口也只接受服务端下发，所以只能在板级补。
++    //
++    // 采样率必须对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000），
++    // 否则 OpusHead 里写的是别的速率，固件需要额外重采样，听感会变慢或变快。
++    // -----------------------------------------------------------------------
++    void InitializeTools() {
++        auto& mcp_server = McpServer::GetInstance();
++        mcp_server.AddTool(
++            "self.audio.play_url",
++            "播放一段网络音频，用于讲故事、播放录制好的语音或音乐片段。"
++            "url 必须是设备能直接下载的【单声道 Ogg Opus（.ogg）】音频直链，"
++            "采样率 24000 Hz：本设备没有 MP3 解码器，也不支持立体声，"
++            "格式不符会完全没有声音。"
++            "播放会打断当前对话，播放期间不能同时对话，播完自动回到待机。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [](const PropertyList& properties) -> ToolResult {
++                const auto url = properties["url"].value<std::string>();
++                if (url.empty()) {
++                    return std::unexpected("url 不能为空");
++                }
++                if (!Application::GetInstance().PlayAudioUrl(url)) {
++                    return std::unexpected("设备当前无法开始播放，请稍后再试");
++                }
++                return std::string("已开始播放音频");
++            });
++    }
++
+     virtual AudioCodec* GetAudioCodec() override {
+         static AiPassportAudioCodec audio_codec(
+             codec_i2c_bus_,
+-- 
+2.50.1 (Apple Git-155)
+

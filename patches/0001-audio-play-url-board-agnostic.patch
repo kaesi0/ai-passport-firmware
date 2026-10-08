@@ -1,0 +1,139 @@
+From 6243a9b62bf6f1a32db7a26c3237c381a75234fd Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Tue, 6 Oct 2026 20:32:47 +0800
+Subject: [PATCH] =?UTF-8?q?feat(audio):=20=E6=96=B0=E5=A2=9E=20Application?=
+ =?UTF-8?q?::PlayAudioUrl()=EF=BC=8C=E8=AE=A9=E6=9D=BF=E7=BA=A7=20MCP=20?=
+ =?UTF-8?q?=E5=B7=A5=E5=85=B7=E8=83=BD=E4=B8=BB=E5=8A=A8=E6=92=AD=E6=8A=A5?=
+ =?UTF-8?q?=E7=BD=91=E7=BB=9C=E9=9F=B3=E9=A2=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+适用基线：78/xiaozhi-esp32 发布标签 v2.5.0
+
+固件里不存在任何「播某个 URL」的能力：官方 notify 只接受服务端下发控制报文
+（application.cc 的 StartNotification），而它的首行门禁要求设备处于 Idle。
+MCP 工具被调用时设备必然在 Listening/Speaking，因此直接调用会被静默丢弃。
+
+本补丁只在 application.h/.cc 增加一个公开入口 PlayAudioUrl(url)：
+  1) 先按当前状态腾挪回 Idle（Notifying -> StopNotification；Speaking -> AbortSpeaking；
+     Listening -> CloseAudioChannel），因为状态机（device_state_machine.cc）不允许
+     Listening/Speaking 直接进 Notifying；
+  2) 再复用 StartNotification 走 Idle -> Notifying。
+
+板无关：不依赖任何具体板子的引脚、屏幕或摄像头；各板只需在 InitializeTools() 里
+注册一个 self.audio.play_url 工具并调用本方法。
+
+音频约束（由 NotifyPlayer + OggDemuxer 决定，与官方 notify 完全一致）：
+  - Ogg Opus 单声道；采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE；
+  - 逻辑包 <= 2048 字节、包长 <= 120ms；不跟重定向；仅接受 2xx；
+  - 固件无 MP3 解码器，立体声会被直接中止（不降混）。
+---
+ main/application.cc | 62 +++++++++++++++++++++++++++++++++++++++++++++
+ main/application.h  | 17 +++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/main/application.cc b/main/application.cc
+index f3f4a68..277d972 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -1093,6 +1093,68 @@ void Application::ConfigureWakeWordForListening() {
+ #endif
+ }
+ 
++// ============================================================================
++// [本地补丁] 对话中主动播报音频（板级 MCP 工具 self.audio.play_url 的落点）
++//
++// 为什么不能直接调 StartNotification：
++//   1) 它的首行门禁是 `GetDeviceState() != kDeviceStateIdle -> return`（静默丢弃），
++//      而 MCP 工具被调用时设备必然处于 Listening/Speaking（用户刚说完话，服务端
++//      正在处理），因此请求 100% 被丢掉，且只留一行 ESP_LOGW。
++//   2) 状态机不允许 Listening/Speaking 直接转入 Notifying——它们只能回到 Idle
++//      （device_state_machine.cc:87-95：Listening -> Speaking|Idle，
++//       Speaking -> Listening|Idle；而 Notifying 只接受从 Idle 进入）。
++//      所以必须先显式回到 Idle，再交给 StartNotification 走 Idle -> Notifying。
++//
++// 两路声音不会打架：服务端推来的 TTS 音频包只在设备处于 kDeviceStateSpeaking 时
++// 才被投喂解码队列（application.cc:553-557）。设备一旦进入 Notifying，服务端的
++// 音频包会被直接丢弃；服务端随后的 tts start/stop 也只会命中 Speaking 分支而失效
++// （:624-637），不会打断播报。
++// ============================================================================
++bool Application::PlayAudioUrl(const std::string& url) {
++    if (url.empty()) {
++        ESP_LOGW(TAG, "PlayAudioUrl: refusing empty url");
++        return false;
++    }
++
++    // 本方法由 MCP 工具回调调用，而 McpServer 已用 Schedule 把回调派发到主任务
++    // （mcp_server.cc:615 "Use main thread to call the tool"），所以这里可以安全地
++    // 直接操作状态机与音频服务，无需再 Schedule 一次。
++    const auto state = GetDeviceState();
++
++    if (state == kDeviceStateNotifying) {
++        // 已在播报：先停掉旧的（StopNotification 内部会切回 Idle），再起新的
++        ESP_LOGI(TAG, "PlayAudioUrl: replacing notification in progress");
++        StopNotification();
++    } else if (state == kDeviceStateSpeaking) {
++        // 正在说话：先让服务端停止产出，避免"AI 还在说话就插播"的听感撕裂
++        AbortSpeaking(kAbortReasonNone);
++    } else if (state == kDeviceStateListening) {
++        // 正在听：关闭音频通道（与 WakeWordInvoke 在 Listening 下的处理一致）
++        if (protocol_) {
++            protocol_->CloseAudioChannel();
++        }
++    }
++
++    // 状态机要求：Notifying 只能从 Idle 进入，所以先回 Idle。
++    // Speaking -> Idle / Listening -> Idle 都是合法转换。
++    if (GetDeviceState() != kDeviceStateIdle) {
++        if (!SetDeviceState(kDeviceStateIdle)) {
++            ESP_LOGE(TAG, "PlayAudioUrl: cannot return to idle (state=%d)",
++                     static_cast<int>(GetDeviceState()));
++            return false;
++        }
++    }
++
++    StartNotification(url, {});
++
++    if (GetDeviceState() != kDeviceStateNotifying) {
++        ESP_LOGE(TAG, "PlayAudioUrl: playback did not start");
++        return false;
++    }
++    ESP_LOGI(TAG, "PlayAudioUrl: started, url=%s", url.c_str());
++    return true;
++}
++
+ void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+diff --git a/main/application.h b/main/application.h
+index f2b9a00..611478d 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -118,6 +118,23 @@ public:
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
++
++    /**
++     * [本地补丁] 播报一段网络音频（板级 MCP 工具 self.audio.play_url 的入口）
++     *
++     * 与 StartNotification 的差别：允许在对话过程中被调用——会先中断当前对话，
++     * 再进入播报态。直接调用 StartNotification 不行：MCP 工具被调用时设备必然
++     * 处于 Listening/Speaking，而它首行门禁要求 kDeviceStateIdle，会被静默丢弃；
++     * 且状态机不允许 Listening/Speaking 直接转入 Notifying。
++     *
++     * 约束（由固件决定，调用方需保证 URL 合规）：
++     *   - 单声道 Ogg Opus，采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 16000）；
++     *   - 播报与对话共用同一条解码队列，播报期间无法对话；
++     *   - 播完自动回到 Idle，可用唤醒词中途打断（见 WakeWordInvoke）。
++     *
++     * @return true 表示已进入播报态（kDeviceStateNotifying）
++     */
++    bool PlayAudioUrl(const std::string& url);
+     
+     /**
+      * Reset protocol resources (thread-safe)
+-- 
+2.50.1 (Apple Git-155)
+

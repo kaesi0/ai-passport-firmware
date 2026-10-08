@@ -1,0 +1,24 @@
+From b4d3939dd4cea2070933411f26119c57055a3969 Mon Sep 17 00:00:00 2001
+From: ai-passport recipe <recipe@localhost>
+Date: Tue, 6 Oct 2026 23:30:01 +0800
+Subject: [PATCH] build(ai-passport): bump PROJECT_VER to 9.9.9 to block
+ official OTA overwrite
+
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1a409e8..894b75c 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.1")
++set(PROJECT_VER "9.9.9")
+ project(xiaozhi)
+-- 
+2.50.1 (Apple Git-155)
+
