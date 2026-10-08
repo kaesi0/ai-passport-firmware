@@ -49,7 +49,7 @@ jobs:
           # 字典序即 0001 → 0005，顺序不能乱（0002 依赖 0001，0004 依赖 0003）
           for p in ../recipe/patches/*.patch; do
             echo ">>> $(basename "$p")"
-            if git am --keep-cr=false "$p"; then
+            if git am "$p"; then
               echo "    applied via git am"
             else
               git am --abort || true

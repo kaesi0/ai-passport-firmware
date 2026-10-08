@@ -1,4 +1,4 @@
-From 98c1b18a0a0fc72314007c7d02717422caac3c86 Mon Sep 17 00:00:00 2001
+From d2d39b7828992793e946ce3afdc663bf7bfb7fd7 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
 Date: Tue, 6 Oct 2026 21:10:29 +0800
 Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E6=96=B0=E5=A2=9E?=
@@ -49,11 +49,11 @@ review 修复（相对初版）：
      原实现没有。坏图会一路走到 ShowFullscreenImage 才被拒，且错误被误导成
      "屏幕不支持全屏图片"。
 ---
- .../folotoy/ai-passport/ai_passport_board.cc  | 289 ++++++++++++++++++
- 1 file changed, 289 insertions(+)
+ .../folotoy/ai-passport/ai_passport_board.cc  | 291 ++++++++++++++++++
+ 1 file changed, 291 insertions(+)
 
 diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
-index 766b6be..f0815f8 100644
+index 766b6be..8db7111 100644
 --- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
 +++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
 @@ -5,10 +5,13 @@
@@ -98,7 +98,7 @@ index 766b6be..f0815f8 100644
              Application::GetInstance().Schedule([this]() {
                  // Opening the audio channel with the network down would only
                  // raise an error alert, so show the ordinary "connecting" hint
-@@ -1053,6 +1063,248 @@ public:
+@@ -1053,6 +1063,250 @@ public:
      // 采样率必须对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000），
      // 否则 OpusHead 里写的是别的速率，固件需要额外重采样，听感会变慢或变快。
      // -----------------------------------------------------------------------
@@ -249,7 +249,9 @@ index 766b6be..f0815f8 100644
 +        http->Close();
 +
 +        constexpr size_t kMaxDecodedBytes = 120 * 1024;
-+        std::unique_ptr<LvglImage> image;
++        // IsValid() 只在 LvglAllocatedImage 上，不在基类 LvglImage。
++        // ShowFullscreenImage 吃的是 unique_ptr<LvglImage>，这里靠移动转换。
++        std::unique_ptr<LvglAllocatedImage> image;
 +        const char* decoder_used = "none";
 +
 +        // ---- 第一级：LVGL 解码器（本固件为 PNG）----
@@ -347,7 +349,7 @@ index 766b6be..f0815f8 100644
      void InitializeTools() {
          auto& mcp_server = McpServer::GetInstance();
          mcp_server.AddTool(
-@@ -1073,6 +1325,43 @@ public:
+@@ -1073,6 +1327,43 @@ public:
                  }
                  return std::string("已开始播放音频");
              });
