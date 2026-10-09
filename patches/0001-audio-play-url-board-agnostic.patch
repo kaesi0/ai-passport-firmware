@@ -1,18 +1,29 @@
-From 059da934e3afb0ee644554cf0c8cebef01f36d74 Mon Sep 17 00:00:00 2001
+From fad8a20dd70a1ed0e95b13299e62493f00d54c22 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Fri, 9 Oct 2026 12:32:22 +0800
-Subject: [PATCH] feat(audio): queue story audio on the speaking decoder
+Date: Fri, 9 Oct 2026 16:27:43 +0800
+Subject: [PATCH] feat(audio): play a story through the official notification
+ decoder
 
 ---
- main/application.cc | 57 +++++++++++++++++++++++++++++++++++++++++++++
- main/application.h  | 17 ++++++++++++++
- 2 files changed, 74 insertions(+)
+ main/application.cc | 63 ++++++++++++++++++++++++++++++++++++++++++++-
+ main/application.h  | 17 ++++++++++++
+ 2 files changed, 79 insertions(+), 1 deletion(-)
 
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..1386fff 100644
+index 31de205..53fbab6 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -1098,6 +1098,63 @@ void Application::ConfigureWakeWordForListening() {
+@@ -552,7 +552,8 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+-        if (GetDeviceState() == kDeviceStateSpeaking) {
++        const auto state = GetDeviceState();
++        if (state == kDeviceStateSpeaking || state == kDeviceStateNotifying) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+     });
+@@ -1098,6 +1099,66 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
@@ -38,15 +49,18 @@ index 31de205..1386fff 100644
 +        ESP_LOGW(TAG, "PlayAudioUrl: refusing empty url");
 +        return false;
 +    }
-+    // Stay on the official speaking decoder, but do not use its separate
-+    // notification state. That state only accepts Idle and was the path that
-+    // stopped during a long story.
-+    if (GetDeviceState() == kDeviceStateNotifying) {
++    // Official music is protected from the cloud tts-stop message because it is
++    // not in the speaking state. A story must use that same notification state.
++    if (GetDeviceState() == kDeviceStateSpeaking) {
++        AbortSpeaking(kAbortReasonNone);
++    } else if (GetDeviceState() == kDeviceStateListening && protocol_) {
++        protocol_->CloseAudioChannel();
++    } else if (GetDeviceState() == kDeviceStateNotifying) {
 +        StopNotification();
 +    }
-+    if (GetDeviceState() != kDeviceStateSpeaking &&
-+        !SetDeviceState(kDeviceStateSpeaking)) {
-+        ESP_LOGE(TAG, "PlayAudioUrl: cannot enter speaking");
++    if (GetDeviceState() != kDeviceStateIdle &&
++        !SetDeviceState(kDeviceStateIdle)) {
++        ESP_LOGE(TAG, "PlayAudioUrl: cannot return to idle");
 +        return false;
 +    }
 +    if (notify_player_.IsBusy()) {
@@ -69,7 +83,7 @@ index 31de205..1386fff 100644
 +        }
 +        return false;
 +    }
-+    ESP_LOGI(TAG, "PlayAudioUrl: queued on the speaking decoder");
++    ESP_LOGI(TAG, "PlayAudioUrl: queued on the notification decoder");
 +    return true;
 +}
 +
