@@ -1,4 +1,4 @@
-From 25c5f23e4f7e2914b2e57a0ea442795a2270dc6b Mon Sep 17 00:00:00 2001
+From cbc20eba85d50116578dece09458832939235417 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
 Date: Fri, 9 Oct 2026 22:27:08 +0800
 Subject: [PATCH] feat(ai-passport): blank the screen during long audio
@@ -28,11 +28,11 @@ frequency or the radio, so playback cannot be disturbed:
 Long episodes are the single biggest battery cost on this 520 mAh board, so this
 is where the screen-off matters most.
 ---
- .../folotoy/ai-passport/ai_passport_board.cc  | 144 ++++++++++++++++++
- 1 file changed, 144 insertions(+)
+ .../folotoy/ai-passport/ai_passport_board.cc  | 161 ++++++++++++++++++
+ 1 file changed, 161 insertions(+)
 
 diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
-index 766b6be..3cc3ea1 100644
+index 766b6be..53d83ed 100644
 --- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
 +++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
 @@ -95,6 +95,34 @@ static constexpr int kStandbyCpuMinFreq = 40;
@@ -86,7 +86,38 @@ index 766b6be..3cc3ea1 100644
      // Guards the stage transitions against a key press that arrived while they
      // were queued: PowerSaveTimer has already forgiven that press, but the wake
      // handler scheduled behind them has not run yet.
-@@ -624,6 +661,101 @@ private:
+@@ -468,6 +505,8 @@ private:
+                     ArmWakeKeyGuard();
+                 }
+                 WakeUpPowerSaveTimer();
++                // [本地补丁] 播放熄屏与 PowerSaveTimer 无关，得自己点亮（见该函数注释）。
++                WakeScreenFromPlaybackBlank();
+             });
+             // Not released on press-up: the click that belongs to the wake press is
+             // graded a tick after it, so the guard has to outlive the release and
+@@ -560,6 +599,21 @@ private:
+         }
+     }
+ 
++    // [本地补丁] 按键点亮「播放熄屏」的屏幕。
++    //
++    // 为什么必须单独挂一次，而不是复用 WakeFromIdle()：PowerSaveTimer::WakeUp()
++    // 只在它自己 in_sleep_mode_ 为真时才回调 on_exit_sleep_mode_（→ WakeFromIdle），
++    // 而 in_sleep_mode_ 只在它的「调光档」触发时才置位；调光档在
++    // !Application::CanEnterSleepMode() 时会 `ticks_ = 0; return;`，播放态恰恰
++    // 一直是 false。所以播放期间按键根本走不到 WakeFromIdle —— fw-17 实测的现象
++    // 就是「音量键有反应、屏幕不亮」。这里直接挂在按下事件上，与状态无关。
++    void WakeScreenFromPlaybackBlank() {
++        if (!playback_screen_off_) {
++            return;
++        }
++        Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++    }
++
+     // Pin holds are latched in the RTC domain and survive the deep-sleep reset
+     // (see gpio_hold_en: the state is retained when the GPIO's power domain
+     // goes off, including Deep-sleep events). Every hold taken before sleeping
+@@ -624,6 +678,101 @@ private:
          power_save_timer_->SetEnabled(true);
      }
  
@@ -188,7 +219,7 @@ index 766b6be..3cc3ea1 100644
      // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
      // exit callback while it is in its sleep stage, which is exactly from the dim
      // deadline on, so this one path serves both stages.
-@@ -632,6 +764,12 @@ private:
+@@ -632,6 +781,12 @@ private:
              ExitSoftSleep();
              return;
          }
@@ -201,7 +232,7 @@ index 766b6be..3cc3ea1 100644
          GetBacklight()->RestoreBrightness();
      }
  
-@@ -692,6 +830,10 @@ private:
+@@ -692,6 +847,10 @@ private:
          soft_sleep_ticks_ = 0;
          ESP_LOGI(TAG, "Input: waking from soft sleep");
  
@@ -212,7 +243,7 @@ index 766b6be..3cc3ea1 100644
          WakePanel();
          GetBacklight()->RestoreBrightness();
  
-@@ -1036,6 +1178,8 @@ public:
+@@ -1036,6 +1195,8 @@ public:
          InitializeTools();
          GetBacklight()->RestoreBrightness();
          InitializePowerSaveTimer();
