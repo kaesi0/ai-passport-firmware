@@ -1,15 +1,15 @@
-From 53896a557989e5f9dbd0faacb27f72fd45d32b12 Mon Sep 17 00:00:00 2001
+From d6e31da7a7d07e87d95103acddb9fdedacf64b7d Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Fri, 9 Oct 2026 16:43:50 +0800
-Subject: [PATCH] feat(audio): play stories without closing the cloud session
+Date: Fri, 9 Oct 2026 17:16:03 +0800
+Subject: [PATCH] feat(audio): keep story playback across cloud session close
 
 ---
- main/application.cc | 61 ++++++++++++++++++++++++++++++++++++++++++++-
- main/application.h  | 17 +++++++++++++
- 2 files changed, 77 insertions(+), 1 deletion(-)
+ main/application.cc | 66 ++++++++++++++++++++++++++++++++++++++++++++-
+ main/application.h  | 17 ++++++++++++
+ 2 files changed, 82 insertions(+), 1 deletion(-)
 
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..98f0034 100644
+index 31de205..c01f6ec 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -552,7 +552,8 @@ void Application::InitializeProtocol() {
@@ -22,7 +22,19 @@ index 31de205..98f0034 100644
              audio_service_.PushPacketToDecodeQueue(std::move(packet));
          }
      });
-@@ -1098,6 +1099,64 @@ void Application::ConfigureWakeWordForListening() {
+@@ -570,6 +571,11 @@ void Application::InitializeProtocol() {
+     protocol_->OnAudioChannelClosed([this, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+         Schedule([this]() {
++            // The cloud closes the conversation after its spoken reply. A story
++            // already playing must survive that; otherwise it stops immediately.
++            if (GetDeviceState() == kDeviceStateNotifying) {
++                return;
++            }
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -1098,6 +1104,64 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
