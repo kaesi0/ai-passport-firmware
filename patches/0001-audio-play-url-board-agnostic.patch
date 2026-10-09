@@ -1,6 +1,6 @@
-From 3289ce8bb2aed069e8fb73cc4616a8e9e423ea6a Mon Sep 17 00:00:00 2001
+From 7dd3fd6bbba892116f4173bef5caf6b9fed4df43 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Fri, 9 Oct 2026 20:40:35 +0800
+Date: Fri, 9 Oct 2026 21:57:04 +0800
 Subject: [PATCH] feat(audio): play a network audio URL in the notification
  state
 
@@ -9,7 +9,8 @@ self.audio.play_url. StartNotification cannot be called directly: its first
 line requires kDeviceStateIdle, while an MCP tool call always arrives during
 Listening/Speaking, and the state machine only lets Notifying be entered from
 Idle. So PlayAudioUrl leaves the current state, returns to Idle, prepares the
-codec/radio exactly like StartNotification, and then enters Notifying itself.
+codec/radio/WakeWord exactly like StartNotification, and then enters Notifying
+itself.
 
 Why Notifying and not Idle (fw-14 serial trace of the abort):
 
@@ -30,15 +31,20 @@ OnIncomingAudio goes back to upstream's Speaking-only test: with the device
 finally in Notifying, the `|| kDeviceStateNotifying` clause fw-11 added would
 start feeding the cloud's TTS into the story's decode queue.
 
+Cloud sentences are also no longer painted over the screen while Notifying.
+The goodbye audio is already dropped, but showing its text made it look like
+the story had been interrupted and replaced the announce line that belongs on
+screen. The serial log still prints it.
+
 Constraint from the firmware: mono Ogg Opus, logical packets <= 2048 bytes,
 no redirects, 2xx only.
 ---
- main/application.cc | 110 ++++++++++++++++++++++++++++++++++++++++++++
+ main/application.cc | 121 +++++++++++++++++++++++++++++++++++++++++++-
  main/application.h  |  17 +++++++
- 2 files changed, 127 insertions(+)
+ 2 files changed, 137 insertions(+), 1 deletion(-)
 
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..afbe697 100644
+index 31de205..15355ee 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -570,6 +570,11 @@ void Application::InitializeProtocol() {
@@ -66,7 +72,26 @@ index 31de205..afbe697 100644
                      aborted_ = false;
                      SetDeviceState(kDeviceStateSpeaking);
                  });
-@@ -1098,6 +1109,105 @@ void Application::ConfigureWakeWordForListening() {
+@@ -645,8 +656,17 @@ void Application::InitializeProtocol() {
+                         glyphs.clear();
+                     }
+                     ESP_LOGI(TAG, "<< %s", text->valuestring);
+-                    Schedule([display, message = std::string(text->valuestring),
++                    // [本地补丁] 故事播放期间（Notifying）云端的句子一律不上屏。
++                    // 这时候云端来的都是会话收尾的道别（「好啦，那我就先不打扰你啦，拜拜！」），
++                    // 它的音频已经被丢弃、不会打断故事，但把文字盖到屏幕上会让人以为故事被它打断了，
++                    // 而且会把之前留在屏上的报幕文案顶掉。报幕走的是 Speaking，不受影响。
++                    // 串口仍然照原样留 `<< ` 一行，便于排查。
++                    Schedule([this, display, message = std::string(text->valuestring),
+                               glyphs = std::move(glyphs), bpp]() {
++                        if (GetDeviceState() == kDeviceStateNotifying) {
++                            ESP_LOGI(TAG, "Keeping the story screen: cloud sentence not shown");
++                            return;
++                        }
+                         display->AddTextGlyphs(glyphs, bpp);
+                         display->SetChatMessage("assistant", message.c_str());
+                     });
+@@ -1098,6 +1118,105 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
