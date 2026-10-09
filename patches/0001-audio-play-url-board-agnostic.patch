@@ -1,15 +1,15 @@
-From d6e31da7a7d07e87d95103acddb9fdedacf64b7d Mon Sep 17 00:00:00 2001
+From ba0177fd540f0dff5779b2d3534039104f932861 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Fri, 9 Oct 2026 17:16:03 +0800
-Subject: [PATCH] feat(audio): keep story playback across cloud session close
+Date: Fri, 9 Oct 2026 19:34:43 +0800
+Subject: [PATCH] feat(audio): ignore cloud TTS during story playback
 
 ---
- main/application.cc | 66 ++++++++++++++++++++++++++++++++++++++++++++-
- main/application.h  | 17 ++++++++++++
- 2 files changed, 82 insertions(+), 1 deletion(-)
+ main/application.cc | 72 ++++++++++++++++++++++++++++++++++++++++++++-
+ main/application.h  | 17 +++++++++++
+ 2 files changed, 88 insertions(+), 1 deletion(-)
 
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..c01f6ec 100644
+index 31de205..57b22de 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -552,7 +552,8 @@ void Application::InitializeProtocol() {
@@ -34,7 +34,20 @@ index 31de205..c01f6ec 100644
              auto display = Board::GetInstance().GetDisplay();
              display->SetChatMessage("system", "");
              SetDeviceState(kDeviceStateIdle);
-@@ -1098,6 +1104,64 @@ void Application::ConfigureWakeWordForListening() {
+@@ -623,6 +629,12 @@ void Application::InitializeProtocol() {
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
+                 Schedule([this]() {
++                    // A cloud goodbye arrives as another TTS turn. It must not
++                    // replace a story that is already playing.
++                    if (GetDeviceState() == kDeviceStateNotifying) {
++                        ESP_LOGI(TAG, "Ignoring cloud TTS while a story is playing");
++                        return;
++                    }
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+@@ -1098,6 +1110,64 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
