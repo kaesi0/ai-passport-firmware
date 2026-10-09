@@ -1,16 +1,15 @@
-From fad8a20dd70a1ed0e95b13299e62493f00d54c22 Mon Sep 17 00:00:00 2001
+From 53896a557989e5f9dbd0faacb27f72fd45d32b12 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Fri, 9 Oct 2026 16:27:43 +0800
-Subject: [PATCH] feat(audio): play a story through the official notification
- decoder
+Date: Fri, 9 Oct 2026 16:43:50 +0800
+Subject: [PATCH] feat(audio): play stories without closing the cloud session
 
 ---
- main/application.cc | 63 ++++++++++++++++++++++++++++++++++++++++++++-
- main/application.h  | 17 ++++++++++++
- 2 files changed, 79 insertions(+), 1 deletion(-)
+ main/application.cc | 61 ++++++++++++++++++++++++++++++++++++++++++++-
+ main/application.h  | 17 +++++++++++++
+ 2 files changed, 77 insertions(+), 1 deletion(-)
 
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..53fbab6 100644
+index 31de205..98f0034 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -552,7 +552,8 @@ void Application::InitializeProtocol() {
@@ -23,7 +22,7 @@ index 31de205..53fbab6 100644
              audio_service_.PushPacketToDecodeQueue(std::move(packet));
          }
      });
-@@ -1098,6 +1099,66 @@ void Application::ConfigureWakeWordForListening() {
+@@ -1098,6 +1099,64 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
@@ -53,8 +52,6 @@ index 31de205..53fbab6 100644
 +    // not in the speaking state. A story must use that same notification state.
 +    if (GetDeviceState() == kDeviceStateSpeaking) {
 +        AbortSpeaking(kAbortReasonNone);
-+    } else if (GetDeviceState() == kDeviceStateListening && protocol_) {
-+        protocol_->CloseAudioChannel();
 +    } else if (GetDeviceState() == kDeviceStateNotifying) {
 +        StopNotification();
 +    }
