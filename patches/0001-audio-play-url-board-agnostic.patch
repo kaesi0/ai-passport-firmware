@@ -1,18 +1,18 @@
-From 873ee01f6054bc34fa2b7c3a9f58b3bd72db5253 Mon Sep 17 00:00:00 2001
+From 059da934e3afb0ee644554cf0c8cebef01f36d74 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
-Date: Tue, 6 Oct 2026 20:32:47 +0800
-Subject: [PATCH] feat(audio): play story audio on the official speaking path
+Date: Fri, 9 Oct 2026 12:32:22 +0800
+Subject: [PATCH] feat(audio): queue story audio on the speaking decoder
 
 ---
- main/application.cc | 38 ++++++++++++++++++++++++++++++++++++++
- main/application.h  | 17 +++++++++++++++++
- 2 files changed, 55 insertions(+)
+ main/application.cc | 57 +++++++++++++++++++++++++++++++++++++++++++++
+ main/application.h  | 17 ++++++++++++++
+ 2 files changed, 74 insertions(+)
 
 diff --git a/main/application.cc b/main/application.cc
-index cfb1067..8c1cae4 100644
+index 31de205..1386fff 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -1102,6 +1102,44 @@ void Application::ConfigureWakeWordForListening() {
+@@ -1098,6 +1098,63 @@ void Application::ConfigureWakeWordForListening() {
  #endif
  }
  
@@ -38,9 +38,9 @@ index cfb1067..8c1cae4 100644
 +        ESP_LOGW(TAG, "PlayAudioUrl: refusing empty url");
 +        return false;
 +    }
-+
-+    // Official music stays on the speaking downlink. The separate notification
-+    // downloader is what stops or reboots during a long story.
++    // Stay on the official speaking decoder, but do not use its separate
++    // notification state. That state only accepts Idle and was the path that
++    // stopped during a long story.
 +    if (GetDeviceState() == kDeviceStateNotifying) {
 +        StopNotification();
 +    }
@@ -49,8 +49,27 @@ index cfb1067..8c1cae4 100644
 +        ESP_LOGE(TAG, "PlayAudioUrl: cannot enter speaking");
 +        return false;
 +    }
++    if (notify_player_.IsBusy()) {
++        notify_player_.Stop();
++    }
 +    audio_service_.ResetDecoder();
-+    ESP_LOGI(TAG, "PlayAudioUrl: speaking path ready");
++    uint32_t playback_id = ++notification_playback_id_;
++    if (playback_id == 0) {
++        playback_id = ++notification_playback_id_;
++    }
++    const bool started = notify_player_.Start(
++        url, {}, playback_id, nullptr,
++        [this](uint32_t id, bool success) {
++            Schedule([this, id, success]() { HandleNotificationFinished(id, success); });
++        });
++    if (!started) {
++        ESP_LOGE(TAG, "PlayAudioUrl: download did not start");
++        if (GetDeviceState() == kDeviceStateSpeaking) {
++            SetDeviceState(kDeviceStateIdle);
++        }
++        return false;
++    }
++    ESP_LOGI(TAG, "PlayAudioUrl: queued on the speaking decoder");
 +    return true;
 +}
 +
@@ -58,7 +77,7 @@ index cfb1067..8c1cae4 100644
      if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
          ESP_LOGW(TAG, "Ignoring notify message while device is busy");
 diff --git a/main/application.h b/main/application.h
-index f2b9a00..611478d 100644
+index f2b9a00..3458c69 100644
 --- a/main/application.h
 +++ b/main/application.h
 @@ -118,6 +118,23 @@ public:
@@ -75,11 +94,11 @@ index f2b9a00..611478d 100644
 +     * 且状态机不允许 Listening/Speaking 直接转入 Notifying。
 +     *
 +     * 约束（由固件决定，调用方需保证 URL 合规）：
-+     *   - 单声道 Ogg Opus，采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 16000）；
++     *   - 单声道 Ogg Opus，采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000）；
 +     *   - 播报与对话共用同一条解码队列，播报期间无法对话；
 +     *   - 播完自动回到 Idle，可用唤醒词中途打断（见 WakeWordInvoke）。
 +     *
-+     * @return true 表示已进入播报态（kDeviceStateNotifying）
++     * @return true 表示已进入说话态并开始下载
 +     */
 +    bool PlayAudioUrl(const std::string& url);
      
