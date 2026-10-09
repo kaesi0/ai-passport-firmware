@@ -1,4 +1,4 @@
-From cbc20eba85d50116578dece09458832939235417 Mon Sep 17 00:00:00 2001
+From 62a3f5bdff375a5c81b7dd2d5505ac3c7b8221e4 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
 Date: Fri, 9 Oct 2026 22:27:08 +0800
 Subject: [PATCH] feat(ai-passport): blank the screen during long audio
@@ -28,11 +28,11 @@ frequency or the radio, so playback cannot be disturbed:
 Long episodes are the single biggest battery cost on this 520 mAh board, so this
 is where the screen-off matters most.
 ---
- .../folotoy/ai-passport/ai_passport_board.cc  | 161 ++++++++++++++++++
- 1 file changed, 161 insertions(+)
+ .../folotoy/ai-passport/ai_passport_board.cc  | 164 ++++++++++++++++++
+ 1 file changed, 164 insertions(+)
 
 diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
-index 766b6be..53d83ed 100644
+index 766b6be..5853f21 100644
 --- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
 +++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
 @@ -95,6 +95,34 @@ static constexpr int kStandbyCpuMinFreq = 40;
@@ -117,7 +117,7 @@ index 766b6be..53d83ed 100644
      // Pin holds are latched in the RTC domain and survive the deep-sleep reset
      // (see gpio_hold_en: the state is retained when the GPIO's power domain
      // goes off, including Deep-sleep events). Every hold taken before sleeping
-@@ -624,6 +678,101 @@ private:
+@@ -624,6 +678,104 @@ private:
          power_save_timer_->SetEnabled(true);
      }
  
@@ -154,7 +154,20 @@ index 766b6be..53d83ed 100644
 +            return;
 +        }
 +        const int64_t now = esp_timer_get_time();
-+        const bool state_playing = IsPlayingAudio();
++        const auto state = Application::GetInstance().GetDeviceState();
++
++        // 「用户又开始对话」必须**先**判，且不参与下面的状态抖动容差。
++        // 唤醒词与确定键开新会话都必经 Connecting（Application::BeginWakeWordInvoke）。
++        // 如果这条判断放在 playing 分支之后，就会被「允许 <=3 秒抖动」挡住：播放刚被
++        // 打断的那几秒里 playing 仍为真，函数直接 return，屏幕不会亮（review 发现）。
++        if (playback_screen_off_ && state == kDeviceStateConnecting) {
++            ESP_LOGI(TAG, "Playback screen off: user started a new conversation, waking screen");
++            Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++            return;
++        }
++
++        const bool state_playing =
++            state == kDeviceStateSpeaking || state == kDeviceStateNotifying;
 +        if (state_playing) {
 +            last_playing_us_ = now;
 +        }
@@ -179,16 +192,6 @@ index 766b6be..53d83ed 100644
 +                }
 +            }
 +            return;
-+        }
-+
-+        // 非播放态。点亮条件只有「用户重新开始对话」——唤醒词和确定键都会先经过
-+        // Connecting（见 Application::BeginWakeWordInvoke），而朗读自然结束走的是
-+        // Speaking -> Listening，不会命中，所以屏幕会保持黑屏（这是用户要的行为）。
-+        // 按键点亮走 WakeFromIdle，不在这里重复处理。
-+        if (playback_screen_off_ &&
-+            Application::GetInstance().GetDeviceState() == kDeviceStateConnecting) {
-+            ESP_LOGI(TAG, "Playback screen off: user started a new conversation, waking screen");
-+            Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
 +        }
 +    }
 +
@@ -219,7 +222,7 @@ index 766b6be..53d83ed 100644
      // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
      // exit callback while it is in its sleep stage, which is exactly from the dim
      // deadline on, so this one path serves both stages.
-@@ -632,6 +781,12 @@ private:
+@@ -632,6 +784,12 @@ private:
              ExitSoftSleep();
              return;
          }
@@ -232,7 +235,7 @@ index 766b6be..53d83ed 100644
          GetBacklight()->RestoreBrightness();
      }
  
-@@ -692,6 +847,10 @@ private:
+@@ -692,6 +850,10 @@ private:
          soft_sleep_ticks_ = 0;
          ESP_LOGI(TAG, "Input: waking from soft sleep");
  
@@ -243,7 +246,7 @@ index 766b6be..53d83ed 100644
          WakePanel();
          GetBacklight()->RestoreBrightness();
  
-@@ -1036,6 +1195,8 @@ public:
+@@ -1036,6 +1198,8 @@ public:
          InitializeTools();
          GetBacklight()->RestoreBrightness();
          InitializePowerSaveTimer();
