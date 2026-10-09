@@ -156,16 +156,16 @@ index 3462ac0..edda09f 100644
 +    lv_obj_set_style_border_width(obj, 0, 0);
 +    lv_obj_set_style_outline_width(obj, 0, 0);
 +    lv_obj_set_style_radius(obj, 0, 0);
-+    // 黑色底：图片比例与屏幕不一致时，留白处不会透出底下的对话界面。
-+    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
++    // 浅色底：图片比例与屏幕不一致时，留白处不会透出底下的对话界面。
++    // 不用黑色。240x240 的图放到 240x320 屏幕上，黑色上下边会被看成「纯色图」。
++    lv_obj_set_style_bg_color(obj, lv_color_hex(0xF4EFE6), 0);
 +    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
 +    lv_obj_set_pos(obj, 0, 0);
 +    lv_obj_set_size(obj, width_, height_);
 +
 +    lv_image_set_src(obj, dsc);
-+    // STRETCH：让图片在 X/Y 两轴各自缩放铺满控件区域，并自动接管 scale / pivot，
-+    // 比手工算 zoom 省事，也不会因为 pivot 默认在左上角而错位。
-+    lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_STRETCH);
++    // 保持原比例居中。STRETCH 会把正方形图拉成竖图。
++    lv_image_set_inner_align(obj, LV_IMAGE_ALIGN_CENTER);
 +
 +    // 所有权转交 LVGL 对象：对象被删除时释放 LvglImage。
 +    LvglImage* raw_image = image.release();
