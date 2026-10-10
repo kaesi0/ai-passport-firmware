@@ -1,0 +1,50 @@
+From 3ae1e16a9827e900ae7926339f6b2808a68cf77f Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Sat, 10 Oct 2026 14:16:22 +0800
+Subject: [PATCH] fix(audio): keep the radio out of modem sleep while a story
+ plays
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+真机（fw-24，2026-10-10 13:53）实测：云端会话收尾时 `OnAudioChannelClosed` 把射频降到
+LOW_POWER(modem sleep)，**而故事还在下载播放**；109 秒后正在下载的 OSS 流出现 10 秒 stall
+→ `Wait for HTTP content receive timeout` → 整段丢弃。
+
+fw-19 修订里这句降档写在 `Notifying` 守卫**之外**（同步执行），所以"让故事活下来"只做了一半。
+本补丁把它移进守卫内：只有"不在播放故事"时才降档。
+
+（这正是 fw-20 那条 review 修正①的内容 —— 当时因为 fw-20 首次上机实测不理想而被退回；
+现在有了射频档位的直接证据，把它单独作为一个补丁拿回来。）
+---
+ main/application.cc | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/main/application.cc b/main/application.cc
+index 15355ee..b500aab 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -568,13 +568,18 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
+-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+-        Schedule([this]() {
++        Schedule([this, &board]() {
+             // The cloud closes the conversation after its spoken reply. A story
+             // already playing must survive that; otherwise it stops immediately.
+             if (GetDeviceState() == kDeviceStateNotifying) {
++                // [本地补丁] 射频档位也不能降。故事还要继续下载/播放好几分钟，掉进
++                // Wi-Fi 省电（modem sleep）会拉长唤醒延迟 —— 实测（fw-24，2026-10-10）：
++                // 云端会话收尾降档后 109 秒，正在下载的 OSS 流出现 **10 秒 stall**
++                // → `Wait for HTTP content receive timeout` → 整段丢弃。
++                // 故事真正结束后由闲置省电（软休眠）或下一次通道关闭负责降档（≤360 秒）。
+                 return;
+             }
++            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+-- 
+2.50.1 (Apple Git-155)
+

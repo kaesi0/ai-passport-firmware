@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 9 patches)
+    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 10 patches)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -46,7 +46,7 @@ jobs:
           cd src
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 字典序即 0001 → 0009，顺序不能乱（0002 依赖 0001，0004 依赖 0002，0007 依赖 0002 与 0006）
+          # 字典序即 0001 → 0010，顺序不能乱（0002 依赖 0001，0004 依赖 0002，0007 依赖 0002 与 0006）
           for p in ../recipe/patches/*.patch; do
             echo ">>> $(basename "$p")"
             if git am "$p"; then
