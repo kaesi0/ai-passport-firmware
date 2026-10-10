@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 5 patches)
+    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 8 patches)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1

@@ -15,7 +15,7 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 
 ## 补丁
 
-按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`。
+按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`，`0008` 独立。
 
 | 补丁 | 层级 | 内容 |
 |---|---|---|
@@ -26,6 +26,7 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 | `0005-ai-passport-project-ver-9.9.9.patch` | 版本 | `PROJECT_VER` → `9.9.9` |
 | `0006-fullscreen-image-layer-board-agnostic.patch` | **板无关** | 常驻全屏图片层 `ShowFullscreenImage/HideFullscreenImage`，`scale=0` 自动按面板尺寸等比铺满 |
 | `0007-ai-passport-image-tools.patch` | 板级 | 图片工具 `show_test_pattern` / `show_image` / `hide_image` |
+| `0008-notify-player-range-resume.patch` | 板无关 | `NotifyPlayer` 抗链路抖动：读超时 5s→10s；读失败/服务端提前关闭时用 `Range` 从已消费字节续传（≤5 次），喂同一个 `OggDemuxer` |
 
 ## 相对官方固件新增的模型可见工具
 
@@ -98,7 +99,7 @@ BASE=0d576d3d4c049c6f55eaf879725dc23e516511b4
 git clone https://github.com/78/xiaozhi-esp32.git fresh && cd fresh
 git checkout "$BASE"
 for p in ../patches/*.patch; do git am "$p" || exit 1; done
-git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0007 累计应为 9 files changed, 905 insertions(+), 3 deletions(-)
+git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0008 累计应为 10 files changed, 991 insertions(+), 15 deletions(-)
 ```
 
 不要手工编辑 `.patch`：在已打好依赖补丁的副本里改源码，再 `git format-patch` 导出。
