@@ -98,7 +98,7 @@ BASE=0d576d3d4c049c6f55eaf879725dc23e516511b4
 git clone https://github.com/78/xiaozhi-esp32.git fresh && cd fresh
 git checkout "$BASE"
 for p in ../patches/*.patch; do git am "$p" || exit 1; done
-git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0007 累计应为 9 files changed, 882 insertions(+), 3 deletions(-)
+git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0007 累计应为 9 files changed, 905 insertions(+), 3 deletions(-)
 ```
 
 不要手工编辑 `.patch`：在已打好依赖补丁的副本里改源码，再 `git format-patch` 导出。

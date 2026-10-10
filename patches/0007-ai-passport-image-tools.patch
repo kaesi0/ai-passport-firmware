@@ -1,4 +1,4 @@
-From 0d2184e5d48e19ecf3f641fcd0822a4a052f9447 Mon Sep 17 00:00:00 2001
+From fa9522df87f11387eee5e83307cce96a7de71fb0 Mon Sep 17 00:00:00 2001
 From: kaesi0 <kaesi0@qq.com>
 Date: Sat, 10 Oct 2026 10:16:23 +0800
 Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E6=96=B0=E5=A2=9E?=
@@ -51,12 +51,26 @@ data 必须是 malloc 的基地址；头放尾部才能「下载块直接当像�
   3) 图片可见期间 EnterPlaybackScreenOff() 直接返回，不熄屏。
   本补丁不碰 Application::PlayAudioUrl、NotifyPlayer、音频队列、编解码器、CPU 频率
   与射频；0001~0005 五份补丁逐字节未改。
+
+2026-10-10 code review 追加两条修正（真机测试之前）：
+
+① 显示成功后**点亮面板**。模型在调出图工具之前通常会先说一句（Speaking），而 fw-18 的
+   熄屏条件是「Speaking / Notifying 且距上次按键满 5 秒」——等火山出图那十几秒里屏幕早就
+   熄了。把图显示到**已熄屏**的面板上，用户什么都看不到，非得按一下键才现出来；实测判据
+   会呈现为「日志有 Fullscreen image shown，但用户报屏幕没反应」。新增 WakeScreenForImage()，
+   同时覆盖「播放熄屏」与「软休眠」两种已经关屏的情形（两个 Exit* 都是幂等的）。
+
+② image_shown_at_us_ 由 64 位微秒改为 **32 位毫秒**。该值由 MCP 任务写、由 1 Hz 巡检
+   （esp_timer 任务）读；64 位整型在 32 位 MCU 上不是单指令访问，可能撕裂——读到「未来」
+   的值会让自动关闭永不触发，图片一直占着屏幕且禁止调光/休眠，把 520mAh 电池耗干。
+   32 位是单指令读写；比较写成 (uint32_t)(now/1000 - shown_ms) 的差值形式，天然处理
+   49.7 天回绕（设备睡一次就重启，绕不到）。
 ---
- .../folotoy/ai-passport/ai_passport_board.cc  | 363 +++++++++++++++++-
- 1 file changed, 362 insertions(+), 1 deletion(-)
+ .../folotoy/ai-passport/ai_passport_board.cc  | 386 +++++++++++++++++-
+ 1 file changed, 385 insertions(+), 1 deletion(-)
 
 diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
-index 5853f21..48f2119 100644
+index 5853f21..35c69f9 100644
 --- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
 +++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
 @@ -8,8 +8,13 @@
@@ -102,18 +116,23 @@ index 5853f21..48f2119 100644
  // ============================================================================
  // ES8311 suspend, aligned register-for-register with the FoloToy AI Passport
  // BSP (components/bsp/src/bsp_audio.c). The codec-dev disable path this board
-@@ -287,6 +314,10 @@ private:
+@@ -287,6 +314,15 @@ private:
      int64_t last_playing_us_ = 0;
      esp_timer_handle_t playback_screen_timer_ = nullptr;
  
 +    // [本地补丁 · 图片回显] 全屏图片的显示时刻（0 = 当前没有图片）。
-+    // 与 playback_screen_off_ 一样在 1 Hz 巡检里读，用于 kImageMaxVisibleSeconds 自动关闭。
-+    int64_t image_shown_at_us_ = 0;
++    //
++    // **为什么是 32 位毫秒而不是 64 位微秒**：这个值由 MCP 任务写、由 1 Hz 巡检
++    // （esp_timer 任务）读。64 位整型在 32 位 MCU 上不是单指令访问，可能撕裂——读到
++    // 「未来」的值会让 `now - shown` 变负、自动关闭永远不触发，图片就一直占着屏幕
++    // 且禁止调光/休眠，把 520mAh 电池耗干。32 位是单指令读写；比较改用无符号差值，
++    // 天然处理 49.7 天的回绕（而设备睡一次就重启，绕不到）。
++    uint32_t image_shown_ms_ = 0;
 +
      // Guards the stage transitions against a key press that arrived while they
      // were queued: PowerSaveTimer has already forgiven that press, but the wake
      // handler scheduled behind them has not run yet.
-@@ -453,6 +484,8 @@ private:
+@@ -453,6 +489,8 @@ private:
          auto up = adc_button_[kAdcButtonUp];
          up->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -122,7 +141,7 @@ index 5853f21..48f2119 100644
              Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
          });
          up->OnLongPress([this]() {
-@@ -466,6 +499,8 @@ private:
+@@ -466,6 +504,8 @@ private:
          auto down = adc_button_[kAdcButtonDown];
          down->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -131,7 +150,7 @@ index 5853f21..48f2119 100644
              Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
          });
          down->OnLongPress([this]() {
-@@ -479,6 +514,8 @@ private:
+@@ -479,6 +519,8 @@ private:
          auto ok = adc_button_[kAdcButtonOk];
          ok->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -140,7 +159,7 @@ index 5853f21..48f2119 100644
              Application::GetInstance().Schedule([this]() {
                  // Opening the audio channel with the network down would only
                  // raise an error alert, so show the ordinary "connecting" hint
-@@ -713,6 +750,29 @@ private:
+@@ -713,6 +755,30 @@ private:
          const int64_t now = esp_timer_get_time();
          const auto state = Application::GetInstance().GetDeviceState();
  
@@ -156,8 +175,9 @@ index 5853f21..48f2119 100644
 +            if (state == kDeviceStateNotifying) {
 +                ESP_LOGI(TAG, "[IMG] story started: releasing the image for the audio download");
 +                Application::GetInstance().Schedule([this]() { HideImageNow(); });
-+            } else if (image_shown_at_us_ != 0 &&
-+                       now - image_shown_at_us_ >= (int64_t)kImageMaxVisibleSeconds * 1000000) {
++            } else if (image_shown_ms_ != 0 &&
++                       (uint32_t)(now / 1000 - image_shown_ms_) >=
++                           (uint32_t)kImageMaxVisibleSeconds * 1000u) {
 +                ESP_LOGI(TAG, "[IMG] auto-hide after %ds", kImageMaxVisibleSeconds);
 +                Application::GetInstance().Schedule([this]() { HideImageNow(); });
 +            } else {
@@ -170,7 +190,7 @@ index 5853f21..48f2119 100644
          // 「用户又开始对话」必须**先**判，且不参与下面的状态抖动容差。
          // 唤醒词与确定键开新会话都必经 Connecting（Application::BeginWakeWordInvoke）。
          // 如果这条判断放在 playing 分支之后，就会被「允许 <=3 秒抖动」挡住：播放刚被
-@@ -759,6 +819,11 @@ private:
+@@ -759,6 +825,11 @@ private:
          if (!IsPlayingAudio()) {
              return;  // 排队这一会儿播放可能已经结束了
          }
@@ -182,7 +202,7 @@ index 5853f21..48f2119 100644
          playback_screen_off_ = true;
          ESP_LOGI(TAG, "Playing: screen off after %ds without input (audio keeps running)",
                   kPlaybackScreenOffSeconds);
-@@ -776,6 +841,263 @@ private:
+@@ -776,6 +847,280 @@ private:
          GetBacklight()->RestoreBrightness();
      }
  
@@ -214,7 +234,7 @@ index 5853f21..48f2119 100644
 +            return;
 +        }
 +        display_->HideFullscreenImage();
-+        image_shown_at_us_ = 0;
++        image_shown_ms_ = 0;
 +        if (display_->IsFullscreenImageVisible()) {
 +            ESP_LOGW(TAG, "[IMG] hide failed (display busy)");
 +            return;
@@ -231,6 +251,21 @@ index 5853f21..48f2119 100644
 +        }
 +        Application::GetInstance().Schedule([this]() { HideImageNow(); });
 +        return true;
++    }
++
++    // [本地补丁 · 图片回显] 把「已经关掉的面板」点亮，否则图片会显示在熄屏的面板上。
++    //
++    // 为什么必须有这一步：模型在调出图工具之前通常会先说一句（`Speaking`），而 fw-18 的
++    // 播放熄屏条件是「`Speaking`/`Notifying` 且距上次按键满 5 秒」——等火山出图的十几秒里
++    // 屏幕早就熄了。此时把图显示到已熄屏的面板上，用户什么都看不到，非得按一下键才现出来
++    // （实测判据会是：日志有 `Fullscreen image shown` 但用户报「屏幕没反应」）。
++    // 软休眠同理（闲置 360 秒后屏幕/编解码器都关了）。
++    // 两个 Exit* 都是幂等的（标志为假就直接返回），所以重复调用安全。
++    void WakeScreenForImage() {
++        WakeScreenFromPlaybackBlank();
++        if (soft_sleep_active_) {
++            Application::GetInstance().Schedule([this]() { ExitSoftSleep(); });
++        }
 +    }
 +
 +    // RGB565 写成 LVGL 原生小端两字节（低字节在前）。
@@ -307,7 +342,8 @@ index 5853f21..48f2119 100644
 +            // 失败时 image 仍在作用域内，析构会 heap_caps_free(raw)，不会漏。
 +            return std::unexpected("屏幕层拒绝了测试图案");
 +        }
-+        image_shown_at_us_ = esp_timer_get_time();
++        image_shown_ms_ = (uint32_t)(esp_timer_get_time() / 1000);
++        WakeScreenForImage();   // 面板可能已被播放熄屏/软休眠关掉，点亮它（见该函数注释）
 +        return std::string("已在设备屏幕上显示彩色测试图案（按任意键关闭）");
 +    }
 +
@@ -428,7 +464,8 @@ index 5853f21..48f2119 100644
 +            // 失败时 image 析构会 heap_caps_free(buf)。
 +            return std::unexpected("屏幕层拒绝了这张图");
 +        }
-+        image_shown_at_us_ = esp_timer_get_time();
++        image_shown_ms_ = (uint32_t)(esp_timer_get_time() / 1000);
++        WakeScreenForImage();   // 面板可能已被播放熄屏/软休眠关掉，点亮它（见该函数注释）
 +        ESP_LOGI(TAG, "[IMG] shown; heap free=%u largest=%u",
 +                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
 +                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -446,7 +483,7 @@ index 5853f21..48f2119 100644
      // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
      // exit callback while it is in its sleep stage, which is exactly from the dim
      // deadline on, so this one path serves both stages.
-@@ -1227,16 +1549,55 @@ public:
+@@ -1227,16 +1572,55 @@ public:
              "格式不符会完全没有声音。"
              "播放会打断当前对话，播放期间不能同时对话，播完自动回到待机。",
              PropertyList({Property("url", kPropertyTypeString)}),
