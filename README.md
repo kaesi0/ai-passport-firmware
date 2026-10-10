@@ -19,7 +19,7 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 
 | 补丁 | 层级 | 内容 |
 |---|---|---|
-| `0001-audio-play-url-board-agnostic.patch` | 板无关 | `Application::PlayAudioUrl()`：进官方 `Notifying` 态播放网络音频，云端收尾打不断它 |
+| `0001-audio-play-url-board-agnostic.patch` | 板无关 | `Application::PlayAudioUrl()`：进官方 `Notifying` 态播放网络音频，云端收尾打不断它。**本仓用的是 fw-19 修订**（见下） |
 | `0002-ai-passport-audio-play-url.patch` | 板级 | 注册 `self.audio.play_url` |
 | `0003-heap-stats-largest-free-block.patch` | 板无关 | 诊断：`SystemInfo` 多打一个 `largest block`（无 PSRAM 的板只看 free sram 会误判） |
 | `0004-ai-passport-playback-screen-off.patch` | 板级 | 长音频播放期间熄屏省电；按键点亮 |
@@ -98,7 +98,26 @@ BASE=0d576d3d4c049c6f55eaf879725dc23e516511b4
 git clone https://github.com/78/xiaozhi-esp32.git fresh && cd fresh
 git checkout "$BASE"
 for p in ../patches/*.patch; do git am "$p" || exit 1; done
-git diff --shortstat "$BASE"   # 0001~0007 累计应为 9 files changed, 906 insertions(+), 5 deletions(-)
+git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0007 累计应为 9 files changed, 882 insertions(+), 3 deletions(-)
 ```
 
 不要手工编辑 `.patch`：在已打好依赖补丁的副本里改源码，再 `git format-patch` 导出。
+
+## 关于 `0001` 的两个修订（fw-19 / fw-20）
+
+`0001` 有两份修订，差别只在 `main/application.cc`（55 增 40 删）：
+
+- **fw-19 修订（本仓当前使用）**：进 `Notifying` 态播放 + 播放期间云端句子不上屏。
+- **fw-20 修订**：在 fw-19 之上再加三条 code review 修正——① `OnAudioChannelClosed`
+  不再在故事播放期间把射频降到 `LOW_POWER`（降档改由 `StopNotification()` 在故事真结束时做）；
+  ② `PlayAudioUrl` 遇到「旧下载只是在收尾」时直接失败、保留现状，不再「先停旧的再起不来」；
+  ③ 收到 `https` 音频地址时在串口明确告警（TLS 要 16,749 字节连续堆，本板无 PSRAM 必断流）。
+
+**这三条在真机上从未被验证过**（`固件版本说明.md` 里 fw-19、fw-20 都标着「待验证」），
+而 fw-20 首次上机的实测结果是两次都没放完整集。虽然失败签名（HTTP 读/建连超时、
+`mqtt_client: No PING_RESP`、同时在 Mac 上下载同一 OSS 对象只要 0.136 s / 5.7 MB/s）
+指向**环境侧的设备网络退化**而非这三条改动，但按本项目的规矩「一次只改一处」，
+图片这条线不携带任何未验证的音频改动：**本仓把 `0001` 固定在 fw-19 修订**。
+
+fw-20 那三条要合回来，应该单开一轮：`0001` 换回 fw-20 修订 + 一次完整集回归，
+不与图片同时上线。git 历史里仍在（tag `fw-20` / `fw-21`）。
