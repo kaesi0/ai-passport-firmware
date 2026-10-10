@@ -1,10 +1,11 @@
-From e47445ecfc3b99684a3eb069dcb5b4c775a42509 Mon Sep 17 00:00:00 2001
-From: ai-passport recipe <recipe@localhost>
-Date: Sat, 10 Oct 2026 14:30:55 +0800
+From 8dc4ac2e7cef77a7ae8c61b25a591b812b644038 Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Sat, 10 Oct 2026 21:46:40 +0800
 Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E5=8D=95=E4=B8=80?=
  =?UTF-8?q?=E5=9F=BA=E7=BA=BF=20=E2=80=94=E2=80=94=20=E6=9C=AC=E5=9C=B0?=
- =?UTF-8?q?=E5=85=A8=E9=83=A8=E6=94=B9=E9=80=A0=EF=BC=88=E5=AF=B9=E5=BA=94?=
- =?UTF-8?q?=20fw-26=20/=20=E7=89=88=E6=9C=AC=E5=8F=B7=209.9.26=EF=BC=89?=
+ =?UTF-8?q?=E5=85=A8=E9=83=A8=E6=94=B9=E9=80=A0=EF=BC=88=E6=9C=AC=E6=AC=A1?=
+ =?UTF-8?q?=EF=BC=9A=E9=95=BF=E6=9C=97=E8=AF=BB=E6=89=8D=E6=8A=8A=E8=83=8C?=
+ =?UTF-8?q?=E5=85=89=E8=B0=83=E6=9A=97=E5=88=B0=2010%=EF=BC=89?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -19,7 +20,8 @@ Content-Transfer-Encoding: 8bit
        打不断它；播放期间丢弃云端 TTS、其文字不上屏
   0002 板级注册 self.audio.play_url
   0003 板无关诊断：SystemInfo 多打一个 largest block（本板无 PSRAM，只看 free sram 会误判）
-  0004 板级：长音频播放期间熄屏省电（只关屏幕，不碰音频/编解码器/射频），按键点亮
+  0004 板级：长音频播放期间把**背光调暗到 10%**省电（只动背光，不关面板、不碰音频/
+       编解码器/射频），按键或重新对话时恢复 —— 见下面「本次改动」
   0005 版本号基线：PROJECT_VER 2.5.1 -> 9.9.0（发布构建由 workflow 注入 9.9.<run_number>）
   0006 板无关常驻全屏图片层（scale=0 时按面板尺寸自动等比铺满，不写死分辨率）
   0007 板级图片工具 show_test_pattern / show_image / hide_image
@@ -28,23 +30,48 @@ Content-Transfer-Encoding: 8bit
   0009 板无关续传带退避重试：链路整体断掉时第一次重连必然失败，窗口 60s / 最多 20 次
   0010 板无关：播放故事期间不把射频降到 modem sleep（降档移进 Notifying 守卫内）
 
-累计：10 files changed, 1021 insertions(+), 17 deletions(-)（对 0d576d3）
+累计：10 files changed, 1094 insertions(+), 17 deletions(-)（对 0d576d3）
 
-后续改动方式：在本基线上改 → 提交 → `git format-patch -1` 得到新补丁 → 干净副本
-`git am` 复验 → 推配方仓 → 出 fw-N。**验证发布后把本基线重新 squash 成新基线**
-（旧基线归档到 history/），这样基线恒等于"当前已验证的完整状态"。
+== 本次改动（0004 的修订，2026-10-10）==
+问题（真机日志 firmware/logs/serial-20261010-112007.log）：熄屏判据只看状态
+(state==Speaking || Notifying) 且连续 5 秒无按键，于是「云端在调工具、设备停在
+Speaking 空等」也被当成朗读 —— 等 get_test_image 的 9.3 秒里屏幕被全黑
+(11:26:38 调工具 → 11:26:43 熄屏 → 11:26:47 才拿到图)，用户看不到屏幕
+（生图过程尤其明显；那段窗口里一个音频包都没有）。
+
+改法两处：
+1) 判据收窄成两层：
+   - 有声故事：state==Notifying（显式、可信），连 kStoryDimSeconds(5s) 就调暗；
+   - 知识库这类长朗读：state==Speaking **且真的在出声**
+     (AudioService::IsPlaybackIdle() 为假 —— AudioOutputTask 没有待播包时是 park 在
+     条件变量上的)，连续出声满 kLongReadingDimSeconds(20s) 才调暗。
+   工具空等时播放队列排空 → 该条件永不成立；几秒的短问答也够不着 20s。
+2) 动作从「SleepPanel() + 背光 0（全黑）」改成**只把背光降到 10%**
+   (kPlaybackDimBrightness，与官方 60s 闲置调光同档)：全黑对「还在播内容」的观感
+   太硬，10% 既省电又留得住画面（知识库朗读时屏幕上正是那段文字）。
+
+其余一律不动：恢复条件仍是任意键 / 进 Connecting / 显示图片；软休眠(360s)与
+深睡(2160s)那两档照旧真正关屏；跨任务只读 playback_dimmed_（bool），64 位计时
+时间戳只由 tick 读写。符号一并改名（playback_screen_off_→playback_dimmed_、
+Enter/ExitPlaybackScreenOff→…Dim、WakeScreenFromPlaybackBlank→…Dim、
+playback_screen_timer_→playback_dim_timer_），免得后人按旧名读成「熄屏」。
+
+后续改动方式：在本基线上改 → 提交 → squash 成单个提交 → `git format-patch -1`
+得到新补丁 → 干净副本 `git am` 复验（firmware/build/verify-patch.sh）→ 推配方仓
+→ 出 fw-N。**验证发布后把本基线重新 squash 成新基线**（旧基线归档到 history/），
+这样基线恒等于「当前已验证的完整状态」。
 ---
  CMakeLists.txt                                |   2 +-
  main/application.cc                           | 130 +++-
  main/application.h                            |  17 +
- .../folotoy/ai-passport/ai_passport_board.cc  | 589 ++++++++++++++++++
+ .../folotoy/ai-passport/ai_passport_board.cc  | 662 ++++++++++++++++++
  main/display/display.cc                       |   8 +
  main/display/display.h                        |  27 +
  main/display/lcd_display.cc                   | 123 ++++
  main/display/lcd_display.h                    |  13 +
  main/notify/notify_player.cc                  | 121 +++-
  main/system_info.cc                           |   8 +-
- 10 files changed, 1021 insertions(+), 17 deletions(-)
+ 10 files changed, 1094 insertions(+), 17 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 1a409e8..234eec9 100755
@@ -249,7 +276,7 @@ index f2b9a00..3458c69 100644
      /**
       * Reset protocol resources (thread-safe)
 diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
-index cfe0e68..35c69f9 100644
+index cfe0e68..ab0f68e 100644
 --- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
 +++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
 @@ -4,11 +4,17 @@
@@ -270,37 +297,72 @@ index cfe0e68..35c69f9 100644
  #include <esp_lcd_panel_vendor.h>
  #include <esp_lcd_panel_ops.h>
  #include <esp_pm.h>
-@@ -94,6 +100,56 @@ static constexpr int kStandbyCpuMinFreq = 40;
+@@ -94,6 +100,91 @@ static constexpr int kStandbyCpuMinFreq = 40;
  // wake configuration cannot leave the device asleep until the battery dies.
  static constexpr uint64_t kFallbackWakeupUs = 60ULL * 60ULL * 1000000ULL;
  
 +// ============================================================================
-+// [本地补丁] 长音频播放时熄屏（省电），按键或重新对话时点亮。
++// [本地补丁] 长朗读时把背光调暗（省电），按键或重新对话时恢复。
 +//
 +// 为什么必须单独做一条路径：上面那三档闲置省电（60 s 调光 / 360 s 软休眠 /
 +// 2160 s 深睡）**全部**以 Application::CanEnterSleepMode() 为门，而它在
 +// state != Idle 时一律返回 false。也就是说故事播放（Notifying）和知识库朗读
-+// （Speaking）期间屏幕会一直亮着，一集几分钟就是白白烧电——这正是本补丁要解决的。
++// （Speaking）期间屏幕会一直亮满——一集几分钟就是白白烧电，这正是本补丁要解决的。
 +//
-+// 这条路径**只关屏幕**：面板 display-off + sleep-in，背光归 0。它不碰音频、
-+// 编解码器、I2S、CPU 频率和射频，所以播放不会因此中断或掉帧。
++// 这条路径**只动背光**：面板不关、不进 sleep-in，也不碰音频、编解码器、I2S、
++// CPU 频率和射频，所以播放不会因此中断或掉帧。
 +//
-+// 触发条件：state 处于 Speaking / Notifying，且距上次按键（或播放开始）已过
-+// kPlaybackScreenOffSeconds 秒。用「距上次按键」而不是「播放一开始就关」，是为了：
-+//   - 短回复（几秒）根本不会熄屏，只在长朗读时才熄；
-+//   - 播放中按过键之后，屏幕会再亮这么久，给用户留出看清屏幕的时间。
-+// 点亮条件：
-+//   - 按下任意键（音量 +/-、确定）—— 走 WakeFromIdle；
++// ---------------------------------------------------------------------------
++// 触发条件（2026-10-10 修订：从「所有 Speaking」收窄到「长朗读」，且不再全黑）
++//
++// 原判据只看**状态**（`state == Speaking || Notifying`，连 5 s 无按键就熄屏），
++// 于是把「云端在调工具、设备停在 Speaking 空等」当成了长朗读。真机证据
++// （`firmware/logs/serial-20261010-112007.log`）：
++//
++//     11:26:37.883 State: listening -> speaking        ← 云端开始应答
++//     11:26:38.208 << % get_test_image...              ← 调工具，等结果
++//     11:26:43.833 Playing: screen off after 5s without input   ← 9.3 秒的纯空等里屏幕全黑
++//     11:26:47.476 << % self.screen.show_image...      ← 才拿到图
++//
++// 那段窗口里**一个音频包都没有**。等图/等故事地址的十几秒被打成黑屏，用户看不到
++// 屏幕（生图过程尤其明显）。所以判定改成两层：
++//
++//   A. **有声故事**：`state == kDeviceStateNotifying` —— 这是我们自己起的播放态，
++//      显式、可信，连 kStoryDimSeconds 秒无按键就调暗（不看有没有声音：故事换集、
++//      网络卡顿的静音间隙不该把屏幕又点亮）。
++//   B. **知识库这类长朗读**：`state == kDeviceStateSpeaking` **且真的在出声**
++//      （`AudioService::IsPlaybackIdle()` 为假），连续出声满 kLongReadingDimSeconds
++//      秒才调暗。工具调用空等时播放队列是排空的 → 这条永远不成立 → 屏幕保持全亮。
++//
++// 「真的在出声」为什么可信：`AudioOutputTask()` 在没有待播包时是 **park 在条件
++// 变量上**的，`IsPlaybackDrainedLocked()` 判的是解码/播放队列都空、且没有 in-flight
++// 的编解码与输出。所以它就是「这一刻喇叭有没有在响」，与「状态是不是 Speaking」无关。
++// 句间停顿会让队列短暂排空，所以用 kAudioGapToleranceSeconds 的窗口跨过去。
++//
++// 动作从「面板关掉 + 背光 0」改成**只把背光降到 kPlaybackDimBrightness**（10%，
++// 与官方 60 s 闲置调光同一档）：全黑对「还在播内容」的观感太硬，10% 既省电又留得住
++// 画面（知识库朗读时屏幕上正是那段文字）。
++//
++// 恢复（原「点亮」）条件不变：
++//   - 按下任意键（音量 +/-、确定）—— 走 WakeFromIdle 之外单独挂的一次（见下）；
 +//   - 状态进入 Connecting —— 唤醒词和确定键开新会话都必经这里
 +//     （Application::BeginWakeWordInvoke 里明确 SetDeviceState(kDeviceStateConnecting)），
-+//     所以它精确地代表「用户又开始对话了」。
-+// 刻意**不**在 Speaking -> Listening 时点亮：朗读自然结束走的就是这条路，而用户要的是
-+// 「播放结束保持黑屏」。代价是「朗读中用唤醒词打断」这一种情形屏幕不亮（按键仍可点亮），
++//     所以它精确地代表「用户又开始对话了」；
++//   - 显示全屏图片（WakeScreenForImage）—— 报幕超时/长朗读期间出图，必须看得见。
++// 刻意**不**在 Speaking -> Listening 时恢复：朗读自然结束走的就是这条路，而用户要的是
++// 「读完先保持暗着」。代价是「朗读中用唤醒词打断」这一种情形屏幕不自动变亮（按键仍可），
 +// 因为它在状态上无法与自然结束区分。
-+// 播放自然结束（回到 Idle/Listening）时保持熄灭，等按键或下一次对话再亮，这样最省电；
-+// 之后 360 s 的软休眠/2160 s 的深睡仍按原逻辑接管。
++// 播放自然结束（回到 Idle/Listening）时保持暗，等按键或下一次对话再恢复，这样最省电；
++// 之后 360 s 的软休眠/2160 s 的深睡仍按原逻辑接管（那两档照旧会真正关屏）。
 +// ============================================================================
-+static constexpr int kPlaybackScreenOffSeconds = 5;
++// 有声故事：进 Notifying 后多少秒调暗。
++static constexpr int kStoryDimSeconds = 5;
++// 知识库这类**长朗读**：连续出声满多少秒才调暗（普通问答 3~10 s，够不着这个门槛）。
++static constexpr int kLongReadingDimSeconds = 20;
++// 句间停顿的容忍窗口：超过它就算「这一段朗读结束了」，重新计时。
++static constexpr int kAudioGapToleranceSeconds = 3;
++// 调暗档位（百分比）。与官方 60 s 闲置调光同一档（见上面 kDimBrightness）。
++static constexpr int kPlaybackDimBrightness = 10;
 +
 +// ============================================================================
 +// [本地补丁 · 图片回显] 全屏图片的常量
@@ -327,18 +389,25 @@ index cfe0e68..35c69f9 100644
  // ============================================================================
  // ES8311 suspend, aligned register-for-register with the FoloToy AI Passport
  // BSP (components/bsp/src/bsp_audio.c). The codec-dev disable path this board
-@@ -249,6 +305,24 @@ private:
+@@ -249,6 +340,31 @@ private:
      // that lands in that window.
      int64_t last_key_us_ = 0;
  
-+    // [本地补丁] 播放熄屏：屏幕当前是否由这条路径关着、播放开始时刻、
-+    // 以及 1 Hz 的状态轮询定时器。全部只在主任务上读写（tick 只做判断，
-+    // 真正动屏幕/背光的动作都 Schedule 到主任务），详见文件顶部那段说明。
-+    bool playback_screen_off_ = false;
-+    bool was_playing_ = false;
-+    int64_t playback_started_us_ = 0;
-+    int64_t last_playing_us_ = 0;
-+    esp_timer_handle_t playback_screen_timer_ = nullptr;
++    // [本地补丁] 长朗读调暗：背光当前是否由这条路径压着、两段计时（有声故事 /
++    // 真的在出声的朗读）、以及 1 Hz 的状态轮询定时器。
++    //
++    // 跨任务纪律：**计时用的 64 位时间戳只由 tick（esp_timer 任务）写、也只由它读**；
++    // 主任务只读 `playback_dimmed_` 这个 bool 并动背光。原因见 image_shown_ms_ 那段
++    // 注释——64 位非原子，跨任务读可能撕裂；这里干脆不给它撕裂的机会。
++    // `playback_dimmed_` 是单字节读写，最坏情况只是一次多余的「恢复」（幂等）。
++    bool playback_dimmed_ = false;
++    // 有声故事段的起点（进 Notifying 时打点）。
++    int64_t story_started_us_ = 0;
++    int64_t last_story_us_ = 0;
++    // 「真的在出声」那一小段的起点与最近一次出声时刻（容忍句间停顿）。
++    int64_t audible_started_us_ = 0;
++    int64_t last_audible_us_ = 0;
++    esp_timer_handle_t playback_dim_timer_ = nullptr;
 +
 +    // [本地补丁 · 图片回显] 全屏图片的显示时刻（0 = 当前没有图片）。
 +    //
@@ -352,7 +421,7 @@ index cfe0e68..35c69f9 100644
      // Guards the stage transitions against a key press that arrived while they
      // were queued: PowerSaveTimer has already forgiven that press, but the wake
      // handler scheduled behind them has not run yet.
-@@ -415,6 +489,8 @@ private:
+@@ -415,6 +531,8 @@ private:
          auto up = adc_button_[kAdcButtonUp];
          up->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -361,7 +430,7 @@ index cfe0e68..35c69f9 100644
              Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
          });
          up->OnLongPress([this]() {
-@@ -428,6 +504,8 @@ private:
+@@ -428,6 +546,8 @@ private:
          auto down = adc_button_[kAdcButtonDown];
          down->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -370,7 +439,7 @@ index cfe0e68..35c69f9 100644
              Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
          });
          down->OnLongPress([this]() {
-@@ -441,6 +519,8 @@ private:
+@@ -441,6 +561,8 @@ private:
          auto ok = adc_button_[kAdcButtonOk];
          ok->OnClick([this]() {
              if (KeyEventsBlocked()) return;
@@ -379,16 +448,16 @@ index cfe0e68..35c69f9 100644
              Application::GetInstance().Schedule([this]() {
                  // Opening the audio channel with the network down would only
                  // raise an error alert, so show the ordinary "connecting" hint
-@@ -467,6 +547,8 @@ private:
+@@ -467,6 +589,8 @@ private:
                      ArmWakeKeyGuard();
                  }
                  WakeUpPowerSaveTimer();
-+                // [本地补丁] 播放熄屏与 PowerSaveTimer 无关，得自己点亮（见该函数注释）。
-+                WakeScreenFromPlaybackBlank();
++                // [本地补丁] 长朗读调暗与 PowerSaveTimer 无关，得自己恢复（见该函数注释）。
++                WakeScreenFromPlaybackDim();
              });
              // Not released on press-up: the click that belongs to the wake press is
              // graded a tick after it, so the guard has to outlive the release and
-@@ -559,6 +641,21 @@ private:
+@@ -559,6 +683,21 @@ private:
          }
      }
  
@@ -400,62 +469,71 @@ index cfe0e68..35c69f9 100644
 +    // !Application::CanEnterSleepMode() 时会 `ticks_ = 0; return;`，播放态恰恰
 +    // 一直是 false。所以播放期间按键根本走不到 WakeFromIdle —— fw-17 实测的现象
 +    // 就是「音量键有反应、屏幕不亮」。这里直接挂在按下事件上，与状态无关。
-+    void WakeScreenFromPlaybackBlank() {
-+        if (!playback_screen_off_) {
++    void WakeScreenFromPlaybackDim() {
++        if (!playback_dimmed_) {
 +            return;
 +        }
-+        Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++        Application::GetInstance().Schedule([this]() { ExitPlaybackDim(); });
 +    }
 +
      // Pin holds are latched in the RTC domain and survive the deep-sleep reset
      // (see gpio_hold_en: the state is retained when the GPIO's power domain
      // goes off, including Deep-sleep events). Every hold taken before sleeping
-@@ -623,6 +720,407 @@ private:
+@@ -623,6 +762,438 @@ private:
          power_save_timer_->SetEnabled(true);
      }
  
 +    // ------------------------------------------------------------------
-+    // [本地补丁] 长音频播放时熄屏，按键或重新开始对话时点亮。
-+    // 详细理由见文件顶部 kPlaybackScreenOffSeconds 那段注释。
++    // [本地补丁] 长朗读时把背光调暗，按键或重新开始对话时恢复。
++    // 详细理由见文件顶部 kStoryDimSeconds / kLongReadingDimSeconds 那段注释。
 +    // ------------------------------------------------------------------
-+    void InitializePlaybackScreenTimer() {
++    void InitializePlaybackDimTimer() {
 +        esp_timer_create_args_t args = {};
 +        args.callback = [](void* arg) {
-+            static_cast<AiPassportBoard*>(arg)->OnPlaybackScreenTick();
++            static_cast<AiPassportBoard*>(arg)->OnPlaybackDimTick();
 +        };
 +        args.arg = this;
-+        args.name = "playback_screen";
-+        esp_err_t err = esp_timer_create(&args, &playback_screen_timer_);
++        args.name = "playback_dim";
++        esp_err_t err = esp_timer_create(&args, &playback_dim_timer_);
 +        if (err != ESP_OK) {
-+            ESP_LOGE(TAG, "Playback screen timer create failed: %s", esp_err_to_name(err));
-+            playback_screen_timer_ = nullptr;
++            ESP_LOGE(TAG, "Playback dim timer create failed: %s", esp_err_to_name(err));
++            playback_dim_timer_ = nullptr;
 +            return;
 +        }
 +        // 1 Hz：和 PowerSaveTimer 同频，判断足够细，开销可忽略。
-+        esp_timer_start_periodic(playback_screen_timer_, 1000 * 1000);
++        esp_timer_start_periodic(playback_dim_timer_, 1000 * 1000);
 +    }
 +
-+    // 播放态：Speaking = 云端 TTS（含 knowledge MCP 念知识库），Notifying = 有声故事。
-+    bool IsPlayingAudio() const {
-+        const auto state = Application::GetInstance().GetDeviceState();
-+        return state == kDeviceStateSpeaking || state == kDeviceStateNotifying;
++    // 「真的在出声」：状态是 Speaking **且**播放队列里确实有音频。
++    //
++    // 只看状态会把「云端在调工具、设备停在 Speaking 空等」当成朗读（真机证据见文件顶部
++    // 注释里的 11:26:38~47 那段：等 get_test_image 的 9.3 秒里屏幕被全黑）。AudioOutputTask
++    // 没有待播包时是 park 在条件变量上的，所以 IsPlaybackIdle() 就是「喇叭这一刻有没有在响」。
++    //
++    // 这一句会取 audio_queue_mutex_（临界区只做几个队列判空），1 Hz 一次；它跑在 esp_timer
++    // 任务上，与背光渐变定时器同任务，所以临界区必须保持极短——别在这里加别的工作。
++    bool IsActuallySpeaking() const {
++        if (Application::GetInstance().GetDeviceState() != kDeviceStateSpeaking) {
++            return false;
++        }
++        return !Application::GetInstance().GetAudioService().IsPlaybackIdle();
 +    }
 +
-+    // 跑在 esp_timer 任务上，只做判断；真正动面板/背光的一律 Schedule 到主任务。
-+    void OnPlaybackScreenTick() {
-+        if (playback_screen_timer_ == nullptr) {
++    // 跑在 esp_timer 任务上，只做判断；真正动背光的一律 Schedule 到主任务。
++    void OnPlaybackDimTick() {
++        if (playback_dim_timer_ == nullptr) {
 +            return;
 +        }
 +        const int64_t now = esp_timer_get_time();
 +        const auto state = Application::GetInstance().GetDeviceState();
 +
 +        // ------------------------------------------------------------------
-+        // [本地补丁 · 图片回显] 全屏图片的看护（与播放熄屏共用这一个 1 Hz 巡检）
++        // [本地补丁 · 图片回显] 全屏图片的看护（与调暗共用这一个 1 Hz 巡检）
 +        //   1) 故事一开播就把图片释放掉，让音频下载拿到最大连续块
 +        //      （兜底：音频工具入口已经同步释放过一次）；
-+        //   2) 图片可见期间不调光不熄屏 —— 把闲置省电的计数一直清零；
++        //   2) 图片可见期间不调光不调暗 —— 把闲置省电的计数一直清零；
 +        //   3) 最长 kImageMaxVisibleSeconds 秒后自动关，恢复官方三档省电。
-+        // 这段必须在下面各条 early-return 之前，否则播放态那两条分支会把它跳过。
++        // 这段必须在下面各条 early-return 之前，否则朗读态那两条分支会把它跳过。
 +        // ------------------------------------------------------------------
 +        if (IsImageVisible()) {
 +            if (state == kDeviceStateNotifying) {
@@ -475,69 +553,91 @@ index cfe0e68..35c69f9 100644
 +
 +        // 「用户又开始对话」必须**先**判，且不参与下面的状态抖动容差。
 +        // 唤醒词与确定键开新会话都必经 Connecting（Application::BeginWakeWordInvoke）。
-+        // 如果这条判断放在 playing 分支之后，就会被「允许 <=3 秒抖动」挡住：播放刚被
-+        // 打断的那几秒里 playing 仍为真，函数直接 return，屏幕不会亮（review 发现）。
-+        if (playback_screen_off_ && state == kDeviceStateConnecting) {
-+            ESP_LOGI(TAG, "Playback screen off: user started a new conversation, waking screen");
-+            Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++        // 如果这条判断放在朗读分支之后，就会被「允许 <=3 秒抖动」挡住：朗读刚被
++        // 打断的那几秒里那段仍为真，函数直接 return，屏幕不会恢复（review 发现）。
++        if (playback_dimmed_ && state == kDeviceStateConnecting) {
++            ESP_LOGI(TAG, "Playback dim: user started a new conversation, restoring the backlight");
++            Application::GetInstance().Schedule([this]() { ExitPlaybackDim(); });
 +            return;
 +        }
 +
-+        const bool state_playing =
-+            state == kDeviceStateSpeaking || state == kDeviceStateNotifying;
-+        if (state_playing) {
-+            last_playing_us_ = now;
++        // ------------------------------------------------------------------
++        // 两段计时：A 有声故事（Notifying，显式）/ B 真的在出声的长朗读（Speaking）
++        // ------------------------------------------------------------------
++        const bool story_state = (state == kDeviceStateNotifying);
++        if (story_state) {
++            last_story_us_ = now;
 +        }
-+        // 连续播放才算「一段播放」，允许 <=3 秒的状态抖动：既避免几秒的短问答被熄屏，
-+        // 也避免云端若按句发 tts stop/start 时反复重置计时、导致长朗读永远不熄屏。
-+        const bool playing =
-+            state_playing || (last_playing_us_ != 0 && now - last_playing_us_ <= 3LL * 1000000);
-+        if (playing && !was_playing_) {
-+            playback_started_us_ = now;
++        // 允许 <=kAudioGapToleranceSeconds 的抖动：故事换集、云端按句发 tts stop/start 时
++        // 状态会短暂离开，不能因此把「一段朗读」拆成两段、反复重置计时。
++        const bool in_story =
++            story_state ||
++            (last_story_us_ != 0 && now - last_story_us_ <= kAudioGapToleranceSeconds * 1000000LL);
++        if (in_story && story_started_us_ == 0) {
++            story_started_us_ = now;
++        } else if (!in_story) {
++            story_started_us_ = 0;
 +        }
-+        was_playing_ = playing;
 +
-+        if (playing) {
-+            // 播放态：距上次按键（或本次播放开始）够久就熄屏。用「距上次按键」
-+            // 而不是「播放一开始就关」有两个好处——几秒的短问答不会熄屏；
-+            // 播放中按过键之后屏幕会再亮满 kPlaybackScreenOffSeconds 秒。
-+            if (!playback_screen_off_) {
-+                const int64_t base =
-+                    playback_started_us_ > last_key_us_ ? playback_started_us_ : last_key_us_;
-+                if (now - base >= (int64_t)kPlaybackScreenOffSeconds * 1000000) {
-+                    Application::GetInstance().Schedule([this]() { EnterPlaybackScreenOff(); });
-+                }
-+            }
-+            return;
++        const bool audible_now = IsActuallySpeaking();
++        if (audible_now) {
++            last_audible_us_ = now;
++        }
++        const bool in_reading =
++            audible_now ||
++            (last_audible_us_ != 0 && now - last_audible_us_ <= kAudioGapToleranceSeconds * 1000000LL);
++        if (audible_now && audible_started_us_ == 0) {
++            audible_started_us_ = now;
++        } else if (!in_reading) {
++            audible_started_us_ = 0;
++        }
++
++        // 要调暗的两种情形，各自有自己的门槛：
++        //   故事：连 kStoryDimSeconds 秒（不看声音——静音间隙不该把屏幕又点亮）
++        //   朗读：连续出声满 kLongReadingDimSeconds 秒（几秒的短问答永远够不着）
++        int64_t base = 0;
++        int64_t need = 0;
++        if (in_story && story_started_us_ != 0) {
++            base = story_started_us_ > last_key_us_ ? story_started_us_ : last_key_us_;
++            need = (int64_t)kStoryDimSeconds * 1000000;
++        } else if (in_reading && audible_started_us_ != 0) {
++            base = audible_started_us_ > last_key_us_ ? audible_started_us_ : last_key_us_;
++            need = (int64_t)kLongReadingDimSeconds * 1000000;
++        }
++
++        if (need != 0 && !playback_dimmed_ && now - base >= need) {
++            Application::GetInstance().Schedule([this]() { EnterPlaybackDim(); });
 +        }
 +    }
 +
-+    void EnterPlaybackScreenOff() {
-+        if (playback_screen_off_ || soft_sleep_active_ || deep_sleep_started_) {
++    void EnterPlaybackDim() {
++        if (playback_dimmed_ || soft_sleep_active_ || deep_sleep_started_) {
 +            return;
 +        }
-+        if (!IsPlayingAudio()) {
-+            return;  // 排队这一会儿播放可能已经结束了
++        // 排队这一会儿朗读可能已经结束了：用**状态**重判一次（这里刻意只读状态与
++        // IsPlaybackIdle()，不读 tick 里写的 64 位时间戳——那是跨任务读，32 位 MCU 上
++        // 可能撕裂；撕裂的后果只是这一次不调暗，1 秒后的巡检会再来）。
++        if (Application::GetInstance().GetDeviceState() != kDeviceStateNotifying &&
++            !IsActuallySpeaking()) {
++            return;
 +        }
-+        // [本地补丁 · 图片回显] 用户正在看图时不熄屏（方案要求：图片可见期间不熄屏）。
++        // [本地补丁 · 图片回显] 用户正在看图时不调暗（方案要求：图片可见期间不变暗）。
 +        // 巡检每秒钟还会 WakeUpPowerSaveTimer()，所以 60 s 调光也不会来。
 +        if (IsImageVisible()) {
 +            return;
 +        }
-+        playback_screen_off_ = true;
-+        ESP_LOGI(TAG, "Playing: screen off after %ds without input (audio keeps running)",
-+                 kPlaybackScreenOffSeconds);
-+        SleepPanel();
-+        GetBacklight()->SetBrightness(0);
++        playback_dimmed_ = true;
++        ESP_LOGI(TAG, "Playing: backlight dimmed to %d%% (long reading; audio keeps running)",
++                 kPlaybackDimBrightness);
++        GetBacklight()->SetBrightness(kPlaybackDimBrightness);
 +    }
 +
-+    void ExitPlaybackScreenOff() {
-+        if (!playback_screen_off_) {
++    void ExitPlaybackDim() {
++        if (!playback_dimmed_) {
 +            return;
 +        }
-+        playback_screen_off_ = false;
-+        ESP_LOGI(TAG, "Playing: screen back on");
-+        WakePanel();
++        playback_dimmed_ = false;
++        ESP_LOGI(TAG, "Playing: backlight restored");
 +        GetBacklight()->RestoreBrightness();
 +    }
 +
@@ -553,7 +653,7 @@ index cfe0e68..35c69f9 100644
 +    // 与音频的三条关系（全是为「不破坏有声故事修复」而设）：
 +    //   1) self.audio.play_url 一被调用就先 HideImageNow()，把连续块立刻还给下载；
 +    //   2) 1 Hz 巡检看到 Notifying 再兜底释放一次；
-+    //   3) 图片可见期间 EnterPlaybackScreenOff() 直接返回，不熄屏。
++    //   3) 图片可见期间 EnterPlaybackDim() 直接返回，不调暗。
 +    // 本段不碰 Application::PlayAudioUrl、NotifyPlayer、音频队列、编解码器与射频。
 +    // ------------------------------------------------------------------
 +
@@ -597,7 +697,7 @@ index cfe0e68..35c69f9 100644
 +    // 软休眠同理（闲置 360 秒后屏幕/编解码器都关了）。
 +    // 两个 Exit* 都是幂等的（标志为假就直接返回），所以重复调用安全。
 +    void WakeScreenForImage() {
-+        WakeScreenFromPlaybackBlank();
++        WakeScreenFromPlaybackDim();
 +        if (soft_sleep_active_) {
 +            Application::GetInstance().Schedule([this]() { ExitSoftSleep(); });
 +        }
@@ -818,31 +918,31 @@ index cfe0e68..35c69f9 100644
      // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
      // exit callback while it is in its sleep stage, which is exactly from the dim
      // deadline on, so this one path serves both stages.
-@@ -631,6 +1129,12 @@ private:
+@@ -631,6 +1202,12 @@ private:
              ExitSoftSleep();
              return;
          }
-+        if (playback_screen_off_) {
-+            // [本地补丁] 播放中按下任意键：点亮屏幕。下一次 tick 会重新开始
-+            // 计时，所以屏幕会亮满 kPlaybackScreenOffSeconds 秒再熄。
-+            ExitPlaybackScreenOff();
++        if (playback_dimmed_) {
++            // [本地补丁] 长朗读中按下任意键：把背光恢复。下一次 tick 会重新开始
++            // 计时，所以屏幕会亮满该段的门槛时长再调暗。
++            ExitPlaybackDim();
 +            return;
 +        }
          GetBacklight()->RestoreBrightness();
      }
  
-@@ -691,6 +1195,10 @@ private:
+@@ -691,6 +1268,10 @@ private:
          soft_sleep_ticks_ = 0;
          ESP_LOGI(TAG, "Input: waking from soft sleep");
  
-+        // [本地补丁] 软休眠醒来时屏幕一律点亮，所以要清掉播放熄屏的标记，
-+        // 否则它会一直是 true，之后就再也熄不了屏（见 WakeFromIdle 的分支顺序）。
-+        playback_screen_off_ = false;
++        // [本地补丁] 软休眠醒来时屏幕一律点亮，所以要清掉播放调暗的标记，
++        // 否则它会一直是 true，之后就再也调不了暗（见 WakeFromIdle 的分支顺序）。
++        playback_dimmed_ = false;
 +
          WakePanel();
          GetBacklight()->RestoreBrightness();
  
-@@ -1030,8 +1538,89 @@ public:
+@@ -1030,8 +1611,89 @@ public:
          InitializeSpi();
          InitializeDisplay();
          InitializeButtons();
@@ -852,7 +952,7 @@ index cfe0e68..35c69f9 100644
          GetBacklight()->RestoreBrightness();
          InitializePowerSaveTimer();
 +        // [本地补丁] 长音频播放期间的熄屏路径，独立于上面三档闲置省电。
-+        InitializePlaybackScreenTimer();
++        InitializePlaybackDimTimer();
 +    }
 +
 +    // -----------------------------------------------------------------------
