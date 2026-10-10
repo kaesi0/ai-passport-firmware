@@ -28,6 +28,21 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 - **验证**：设备串口 `Ota: Current version:` 一行；`firmware/tools/preflight.sh` 会直接核对
   「文件名里的 N」与「设备上报的版本」是否一致。
 
+## 基线版本：`patches/0001-ai-passport-baseline.patch`
+
+**这是本仓唯一的补丁，就是基线版本** —— 等于原先分步补丁 `0001`~`0010` 的**全部内容**，
+首次发布 **fw-27**（设备版本号 `9.9.27`），累计 `10 files changed, 1021 insertions(+), 17 deletions(-)`。
+
+包含十项：①板无关 `Application::PlayAudioUrl()`（进官方 `Notifying` 态播放，云端会话收尾打不断）
+②板级注册 `self.audio.play_url` ③诊断 `largest block`（无 PSRAM，别只看 `free sram`）
+④播放期间熄屏 + 按键点亮 ⑤`PROJECT_VER` 基线 `9.9.0`（发布版本号由本仓 workflow 注入）
+⑥板无关全屏图片层（`scale=0` 自动铺满面板）⑦板级图片工具 `show_test_pattern`/`show_image`/`hide_image`
+⑧`NotifyPlayer` 抗抖动（读超时 10s + `Range` 从已消费字节续传）⑨续传带退避重试（60s/20 次）
+⑩故事播放期间射频保持 PERFORMANCE。**分步链冻结在项目仓 `firmware/patches/history/`，本仓不需要。**
+
+**什么时候出新固件**：基线**代码**变了 → 必须跑 CI + 刷机；只是补丁**结构/命名**变了（源码树哈希没变，
+功能与上一版等价）→ 建议跑一次 CI 确认能编译，**刷机可以省**；只改文档 → 都不用。
+
 ## 补丁
 
 **现行只有一个补丁：`patches/0001-ai-passport-baseline.patch`** —— 它等于 FoloToy AI Passport 上
