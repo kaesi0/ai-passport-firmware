@@ -3,6 +3,10 @@ name: Build AI Passport custom firmware
 on:
   push:
     branches: [main]
+    # 只改文档不要出固件（见 README「什么时候出新固件」）。只要有补丁/工作流/脚本变更，
+    # paths-ignore 就不生效、照常构建——它只在**全部**改动都匹配时才跳过。
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
 
 # 发布 Release 需要写权限；缺了会在最后一步 403
