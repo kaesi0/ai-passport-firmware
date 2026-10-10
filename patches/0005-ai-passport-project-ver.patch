@@ -1,0 +1,30 @@
+From dcdef0fbc72a299f2cf822f84ba74fe1d18fd54e Mon Sep 17 00:00:00 2001
+From: ai-passport recipe <recipe@localhost>
+Date: Sat, 10 Oct 2026 14:06:42 +0800
+Subject: [PATCH] build(ai-passport): keep PROJECT_VER above the cloud version
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 PROJECT_VER 是 2.5.1，不抬高就会被官方 OTA 覆盖回 2.5.1。
+这里只把**基线**设成 9.9.0（保证任何构建都不被覆盖）；**发布构建的版本号由
+workflow 注入 9.9.<run_number>**，与 tag fw-<run_number> 一一对应，
+这样设备串口 `Ota: Current version:` 就能直接确认当前跑的是哪一版。
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1a409e8..234eec9 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.1")
++set(PROJECT_VER "9.9.0")
+ project(xiaozhi)
+-- 
+2.50.1 (Apple Git-155)
+

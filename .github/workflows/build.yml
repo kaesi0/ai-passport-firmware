@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 8 patches)
+    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 9 patches)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -46,7 +46,7 @@ jobs:
           cd src
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 字典序即 0001 → 0005，顺序不能乱（0002 依赖 0001，0004 依赖 0003）
+          # 字典序即 0001 → 0009，顺序不能乱（0002 依赖 0001，0004 依赖 0002，0007 依赖 0002 与 0006）
           for p in ../recipe/patches/*.patch; do
             echo ">>> $(basename "$p")"
             if git am "$p"; then
@@ -61,15 +61,28 @@ jobs:
           # 用 FETCH_HEAD 而不是 HEAD~N：不依赖打了几个补丁，加/减补丁都不用改这里
           git diff --shortstat FETCH_HEAD
 
+      - name: Stamp firmware version (9.9.<run_number>)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 版本号规则（硬要求）：PROJECT_VER = 9.9.<固件编号>，固件编号 = 本次 run_number
+          # = Release tag 的 fw-N。这样设备串口 `Ota: Current version:` 能直接确认跑的是哪一版。
+          # 补丁 0005 只把基线设成 9.9.0（防官方 OTA 覆盖），真正的版本号在这里注入。
+          VER="9.9.${{ github.run_number }}"
+          sed -i "s/^set(PROJECT_VER .*$/set(PROJECT_VER \"$VER\")/" src/CMakeLists.txt
+          grep -q "set(PROJECT_VER \"$VER\")" src/CMakeLists.txt
+          echo "PROJECT_VER 注入为 $VER（对应 tag fw-${{ github.run_number }}）"
+          grep -n PROJECT_VER src/CMakeLists.txt
+
       - name: Sanity checks before build
         shell: bash
         run: |
           set -euo pipefail
           cd src
-          echo "===== PROJECT_VER（须为 9.9.9，否则会被官方 OTA 覆盖）====="
+          echo "===== PROJECT_VER（必须是 9.9.<run_number>，且高于云端 2.5.1）====="
           grep -n 'PROJECT_VER' CMakeLists.txt | head -2
-          grep -q 'set(PROJECT_VER "9.9.9")' CMakeLists.txt || {
-            echo "::error::PROJECT_VER 未抬高，固件会被官方 OTA 覆盖"; exit 1; }
+          grep -q "set(PROJECT_VER \"9.9.${{ github.run_number }}\")" CMakeLists.txt || {
+            echo "::error::PROJECT_VER 不是 9.9.${{ github.run_number }}（版本号规则见 README）"; exit 1; }
           echo "===== 新增 MCP 工具（应列出 4 个：audio.play_url / screen.show_image / screen.show_test_pattern / screen.hide_image）====="
           grep -oE '"self\.(audio|screen)\.[a-z_]+"' \
             main/boards/folotoy/ai-passport/ai_passport_board.cc | sort -u

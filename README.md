@@ -13,9 +13,24 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 | 版本 | `PROJECT_VER=9.9.9`（挡住官方 OTA 覆盖） |
 | 镜像 | `espressif/idf:v6.1` |
 
+## 版本号规则（硬要求）
+
+**`PROJECT_VER` 必须等于 `9.9.<固件编号>`，固件编号就是 Release tag 里的 `fw-N` 的 N**（= GitHub Actions 的
+`run_number`）。例如 tag `fw-25` 的固件，设备串口必须打印 `Ota: Current version: 9.9.25`。
+
+- **为什么不能固定成 9.9.9**：那样无法从设备上确认当前跑的是哪一版——排查时必须先知道固件版本，
+  否则「设备上到底是哪一版」只能靠读 flash 指纹反查。
+- **怎么落地**：补丁 `0005` 只设**基线** `9.9.0`（保证任何本地/手动构建都不会被官方 OTA 覆盖）；
+  发布构建由 workflow 的 `Stamp firmware version` 步骤 `sed` 注入 `9.9.${{ github.run_number }}`，
+  并在 `Sanity checks` 里断言它确实等于 `9.9.<run_number>`（不等就直接失败，不产出固件）。
+- **约束**：版本号必须 **≥ 云端版本**（本板云端是 `2.5.1`）且**单调不减**，否则会被官方 OTA 覆盖回 `2.5.1`。
+  `9.9.N` 满足；N 增大时语义上仍是升序。
+- **验证**：设备串口 `Ota: Current version:` 一行；`firmware/tools/preflight.sh` 会直接核对
+  「文件名里的 N」与「设备上报的版本」是否一致。
+
 ## 补丁
 
-按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`，`0008` 独立。
+按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`；`0003`/`0005`/`0008`/`0009` 独立。
 
 | 补丁 | 层级 | 内容 |
 |---|---|---|
@@ -23,10 +38,11 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 | `0002-ai-passport-audio-play-url.patch` | 板级 | 注册 `self.audio.play_url` |
 | `0003-heap-stats-largest-free-block.patch` | 板无关 | 诊断：`SystemInfo` 多打一个 `largest block`（无 PSRAM 的板只看 free sram 会误判） |
 | `0004-ai-passport-playback-screen-off.patch` | 板级 | 长音频播放期间熄屏省电；按键点亮 |
-| `0005-ai-passport-project-ver-9.9.9.patch` | 版本 | `PROJECT_VER` → `9.9.9` |
+| `0005-ai-passport-project-ver.patch` | 版本 | 把上游 `PROJECT_VER`（`2.5.1`）抬成**基线 `9.9.0`**，防官方 OTA 覆盖；**发布构建的版本号由 workflow 注入**（见「版本号规则」） |
 | `0006-fullscreen-image-layer-board-agnostic.patch` | **板无关** | 常驻全屏图片层 `ShowFullscreenImage/HideFullscreenImage`，`scale=0` 自动按面板尺寸等比铺满 |
 | `0007-ai-passport-image-tools.patch` | 板级 | 图片工具 `show_test_pattern` / `show_image` / `hide_image` |
-| `0008-notify-player-range-resume.patch` | 板无关 | `NotifyPlayer` 抗链路抖动：读超时 5s→10s；读失败/服务端提前关闭时用 `Range` 从已消费字节续传（≤5 次），喂同一个 `OggDemuxer` |
+| `0008-notify-player-range-resume.patch` | 板无关 | `NotifyPlayer` 抗链路抖动：读超时 5s→10s；读失败/服务端提前关闭时用 `Range` 从**已消费字节**续传，喂同一个 `OggDemuxer`（不丢 OpusHead/解析状态） |
+| `0009-notify-player-resume-retry.patch` | 板无关 | 续传**带退避重试**：链路整体断掉时第一次重连必然失败，改为时间窗 60 s / 最多 20 次 / 每次失败等 1.5 s；失败与放弃都打日志 |
 
 ## 相对官方固件新增的模型可见工具
 
@@ -99,7 +115,7 @@ BASE=0d576d3d4c049c6f55eaf879725dc23e516511b4
 git clone https://github.com/78/xiaozhi-esp32.git fresh && cd fresh
 git checkout "$BASE"
 for p in ../patches/*.patch; do git am "$p" || exit 1; done
-git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0008 累计应为 10 files changed, 991 insertions(+), 15 deletions(-)
+git diff --shortstat "$BASE"   # 0001(fw-19 修订)~0009 累计应为 10 files changed, 1014 insertions(+), 15 deletions(-)
 ```
 
 不要手工编辑 `.patch`：在已打好依赖补丁的副本里改源码，再 `git format-patch` 导出。
