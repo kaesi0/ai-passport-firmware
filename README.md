@@ -40,6 +40,8 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 ⑧`NotifyPlayer` 抗抖动（读超时 10s + `Range` 从已消费字节续传）⑨续传带退避重试（60s/20 次）
 ⑩故事播放期间射频保持 PERFORMANCE。**分步链冻结在项目仓 `firmware/patches/history/`，本仓不需要。**
 
+**改本仓的 workflow 时**：要在同一改动里同步项目仓的本地镜像 `firmware/build/build.yml`（`firmware/tools/preflight.sh` 第 ⑥ 项会比对是否同步）。
+
 **什么时候出新固件**：基线**代码**变了 → 必须跑 CI + 刷机；只是补丁**结构/命名**变了（源码树哈希没变，
 功能与上一版等价）→ 建议跑一次 CI 确认能编译，**刷机可以省**；只改文档 → 都不用。
 
