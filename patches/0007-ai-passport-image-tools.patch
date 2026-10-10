@@ -1,0 +1,508 @@
+From 0d2184e5d48e19ecf3f641fcd0822a4a052f9447 Mon Sep 17 00:00:00 2001
+From: kaesi0 <kaesi0@qq.com>
+Date: Sat, 10 Oct 2026 10:16:23 +0800
+Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E6=96=B0=E5=A2=9E?=
+ =?UTF-8?q?=E5=85=A8=E5=B1=8F=E5=9B=BE=E7=89=87=E5=B7=A5=E5=85=B7=20show?=
+ =?UTF-8?q?=5Fimage=20/=20show=5Ftest=5Fpattern=20/=20hide=5Fimage?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+板级补丁，只动 main/boards/folotoy/ai-passport/ai_passport_board.cc。
+依赖 0006（板无关全屏图片层）与 0002（InitializeTools 的存在）。
+
+数据通路（本板无 PSRAM，只有几十 KB 连续堆，这是唯一可行的路）：
+  服务端把图转成 RGB565 原始像素放 OSS -> 只返回一个明文 http 直链
+  -> 设备用 Content-Length **一次** heap_caps_malloc -> 直接读进最终像素缓冲
+  -> 交给 0006 的 ShowFullscreenImage，LVGL 放大铺满。
+零解码、零拷贝、零第二缓冲。旧的看图方案失败在「下载块 + 解码块同时存活」
+与「120 KB 体积红线」（见 图片回显问题修复.md §2）。
+
+文件格式 v1（头在**尾部**，10 字节）：像素 w*h*2（小端）+ "R5G6B5" + w(LE) + h(LE)。
+头放尾部是刻意的：LvglAllocatedImage 析构会 heap_caps_free(image_dsc_.data)，
+data 必须是 malloc 的基地址；头放尾部才能「下载块直接当像素块」，不需要
+第二次分配、也不需要 memcpy。旧实现因为不接受带偏移的指针，只能再拷一份。
+
+三个工具：
+  self.screen.show_test_pattern  本机生成 120x160 色条（8 色竖带 + RGB 渐变 +
+                                 16 级灰阶），不联网、不依赖服务端。阶段 0 的判据：
+                                 颜色排列对 = 图层/字节序/格式三者同时成立；
+                                 红蓝互换 = 通道；条纹错位 = stride；全无 = 图层。
+  self.screen.show_image(url)    下载 RGB565 直链并全屏显示。只给 url **一个**参数，
+                                 不给 base64 的 data —— 交接文档实测「一个返回里同时
+                                 带两种数据时模型会选它熟悉的那个」。https 明确拒绝
+                                 并说明理由（TLS 要 16,749 字节连续堆，必断流）。
+  self.screen.hide_image         关闭全屏图片（按机身任意键也能关）。
+
+内存与省电：
+  - 120x160 = 38,400 字节，在真机实测「空闲最差档 largest block 40,960」之下，
+    fw-20 实测空闲为 55,296；显示前用 heap_caps_get_largest_free_block() 预检，
+    不够就返回可读中文错误，不黑屏。
+  - heap_caps_malloc_prefer(SPIRAM 优先，内部 RAM 兜底)：有 PSRAM 的板不用改代码就
+    能放大图（移植时把 kMaxImageBytes 调大即可）。
+  - 图片可见期间每秒 WakeUpPowerSaveTimer()，把 60 s 调光与 360 s 软休眠一直推后，
+    做到「图片可见期间不调光不熄屏」；最长 kImageMaxVisibleSeconds(300 s) 后自动关，
+    恢复官方三档省电。
+  - 任意键先关图并吃掉本次按键（再按一次才开新会话）。
+
+不破坏有声故事修复的三条（本次硬约束）：
+  1) self.audio.play_url 的工具回调入口先 HideImageNow()，把连续块立刻还给音频下载；
+  2) 1 Hz 巡检看到 Notifying 再兜底释放一次；
+  3) 图片可见期间 EnterPlaybackScreenOff() 直接返回，不熄屏。
+  本补丁不碰 Application::PlayAudioUrl、NotifyPlayer、音频队列、编解码器、CPU 频率
+  与射频；0001~0005 五份补丁逐字节未改。
+---
+ .../folotoy/ai-passport/ai_passport_board.cc  | 363 +++++++++++++++++-
+ 1 file changed, 362 insertions(+), 1 deletion(-)
+
+diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+index 5853f21..48f2119 100644
+--- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
++++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+@@ -8,8 +8,13 @@
+ #include "assets/lang_config.h"
+ #include "cw2017_battery_monitor.h"
+ #include "power_save_timer.h"
++#include "board.h"
++#include "http.h"
++#include "lvgl_image.h"
+ 
+ #include <esp_log.h>
++#include <esp_heap_caps.h>
++#include <cstring>
+ #include <esp_lcd_panel_vendor.h>
+ #include <esp_lcd_panel_ops.h>
+ #include <esp_pm.h>
+@@ -123,6 +128,28 @@ static constexpr uint64_t kFallbackWakeupUs = 60ULL * 60ULL * 1000000ULL;
+ // ============================================================================
+ static constexpr int kPlaybackScreenOffSeconds = 5;
+ 
++// ============================================================================
++// [本地补丁 · 图片回显] 全屏图片的常量
++//
++// 为什么是 120x160：本板无 PSRAM，一张 RGB565 图要 w*h*2 字节**连续**内存。
++// 真机实测（firmware/logs/*.log 的 SystemInfo 行）：
++//     开机 / 新会话空闲    largest block = 53,248 ~ 59,392（fw-20 实测 55,296）
++//     闲置调光后           largest block = 40,960
++//     Speaking 朗读中      largest block = 51,200
++//     Notifying 播放中     largest block = 7,680 ~ 21,504
++//     故事放完回流 Idle    largest block = 19,456（碎片滞留，不回收）
++// 120x160 = 38,400 字节，在「空闲最差档 40,960」之下，且 2 倍正好铺满 240x320。
++// 240x240 要 115,200 字节：整机 free sram 只有 85 KB，永远不可能成立 —— 这正是
++// 旧的 120 KB 体积红线方案的根因（见 图片回显问题修复.md §2.1）。
++// ============================================================================
++static constexpr int kTestPatternWidth = 120;
++static constexpr int kTestPatternHeight = 160;
++// 单张图的下载上限。本板用不到这么大，给有 PSRAM 的板留出余量；真正的闸门是
++// 显示前的 largest block 预检（见 ShowImageFromUrl）。
++static constexpr size_t kMaxImageBytes = 64 * 1024;
++// 图片最长停留时间：到点自动关，把官方三档闲置省电还给设备（520 mAh 电池）。
++static constexpr int kImageMaxVisibleSeconds = 300;
++
+ // ============================================================================
+ // ES8311 suspend, aligned register-for-register with the FoloToy AI Passport
+ // BSP (components/bsp/src/bsp_audio.c). The codec-dev disable path this board
+@@ -287,6 +314,10 @@ private:
+     int64_t last_playing_us_ = 0;
+     esp_timer_handle_t playback_screen_timer_ = nullptr;
+ 
++    // [本地补丁 · 图片回显] 全屏图片的显示时刻（0 = 当前没有图片）。
++    // 与 playback_screen_off_ 一样在 1 Hz 巡检里读，用于 kImageMaxVisibleSeconds 自动关闭。
++    int64_t image_shown_at_us_ = 0;
++
+     // Guards the stage transitions against a key press that arrived while they
+     // were queued: PowerSaveTimer has already forgiven that press, but the wake
+     // handler scheduled behind them has not run yet.
+@@ -453,6 +484,8 @@ private:
+         auto up = adc_button_[kAdcButtonUp];
+         up->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
+         });
+         up->OnLongPress([this]() {
+@@ -466,6 +499,8 @@ private:
+         auto down = adc_button_[kAdcButtonDown];
+         down->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
+         });
+         down->OnLongPress([this]() {
+@@ -479,6 +514,8 @@ private:
+         auto ok = adc_button_[kAdcButtonOk];
+         ok->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键，再按一次才开新会话）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() {
+                 // Opening the audio channel with the network down would only
+                 // raise an error alert, so show the ordinary "connecting" hint
+@@ -713,6 +750,29 @@ private:
+         const int64_t now = esp_timer_get_time();
+         const auto state = Application::GetInstance().GetDeviceState();
+ 
++        // ------------------------------------------------------------------
++        // [本地补丁 · 图片回显] 全屏图片的看护（与播放熄屏共用这一个 1 Hz 巡检）
++        //   1) 故事一开播就把图片释放掉，让音频下载拿到最大连续块
++        //      （兜底：音频工具入口已经同步释放过一次）；
++        //   2) 图片可见期间不调光不熄屏 —— 把闲置省电的计数一直清零；
++        //   3) 最长 kImageMaxVisibleSeconds 秒后自动关，恢复官方三档省电。
++        // 这段必须在下面各条 early-return 之前，否则播放态那两条分支会把它跳过。
++        // ------------------------------------------------------------------
++        if (IsImageVisible()) {
++            if (state == kDeviceStateNotifying) {
++                ESP_LOGI(TAG, "[IMG] story started: releasing the image for the audio download");
++                Application::GetInstance().Schedule([this]() { HideImageNow(); });
++            } else if (image_shown_at_us_ != 0 &&
++                       now - image_shown_at_us_ >= (int64_t)kImageMaxVisibleSeconds * 1000000) {
++                ESP_LOGI(TAG, "[IMG] auto-hide after %ds", kImageMaxVisibleSeconds);
++                Application::GetInstance().Schedule([this]() { HideImageNow(); });
++            } else {
++                // PowerSaveTimer::WakeUp() 只做 ticks_ = 0（并在已进调光档时点亮屏幕），
++                // 不碰音频/编解码器/CPU 频率 —— 用它把 60 s 调光与 360 s 软休眠一直推后。
++                WakeUpPowerSaveTimer();
++            }
++        }
++
+         // 「用户又开始对话」必须**先**判，且不参与下面的状态抖动容差。
+         // 唤醒词与确定键开新会话都必经 Connecting（Application::BeginWakeWordInvoke）。
+         // 如果这条判断放在 playing 分支之后，就会被「允许 <=3 秒抖动」挡住：播放刚被
+@@ -759,6 +819,11 @@ private:
+         if (!IsPlayingAudio()) {
+             return;  // 排队这一会儿播放可能已经结束了
+         }
++        // [本地补丁 · 图片回显] 用户正在看图时不熄屏（方案要求：图片可见期间不熄屏）。
++        // 巡检每秒钟还会 WakeUpPowerSaveTimer()，所以 60 s 调光也不会来。
++        if (IsImageVisible()) {
++            return;
++        }
+         playback_screen_off_ = true;
+         ESP_LOGI(TAG, "Playing: screen off after %ds without input (audio keeps running)",
+                  kPlaybackScreenOffSeconds);
+@@ -776,6 +841,263 @@ private:
+         GetBacklight()->RestoreBrightness();
+     }
+ 
++    // ------------------------------------------------------------------
++    // [本地补丁 · 图片回显] 常驻全屏图片
++    //
++    // 三个工具在 InitializeTools() 里注册：show_test_pattern / show_image / hide_image。
++    // 与显示层（补丁 0006 的 ShowFullscreenImage）的分工：显示层只管「把一块已经准备好
++    // 的像素显示出来」；本段负责「把网络上的 RGB565 直链**一次 malloc** 读进最终像素
++    // 缓冲」—— 零解码、零拷贝、零第二缓冲。这是本板无 PSRAM 前提下唯一可行的数据通路，
++    // 理由与内存账见 图片回显问题修复.md §3。
++    //
++    // 与音频的三条关系（全是为「不破坏有声故事修复」而设）：
++    //   1) self.audio.play_url 一被调用就先 HideImageNow()，把连续块立刻还给下载；
++    //   2) 1 Hz 巡检看到 Notifying 再兜底释放一次；
++    //   3) 图片可见期间 EnterPlaybackScreenOff() 直接返回，不熄屏。
++    // 本段不碰 Application::PlayAudioUrl、NotifyPlayer、音频队列、编解码器与射频。
++    // ------------------------------------------------------------------
++
++    // 图片当前是否可见。任何任务都能读（显示层用的是原子标志）。
++    bool IsImageVisible() const {
++        return display_ != nullptr && display_->IsFullscreenImageVisible();
++    }
++
++    // 关闭图片并打印释放后的堆，用来证明「像素缓冲真的还回去了」。
++    // 调用方可以是主任务，也可以是 MCP 任务（显示层自己会拿 LVGL 锁）。
++    void HideImageNow() {
++        if (!IsImageVisible()) {
++            return;
++        }
++        display_->HideFullscreenImage();
++        image_shown_at_us_ = 0;
++        if (display_->IsFullscreenImageVisible()) {
++            ESP_LOGW(TAG, "[IMG] hide failed (display busy)");
++            return;
++        }
++        ESP_LOGI(TAG, "[IMG] hidden; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    }
++
++    // 按键回调（按键任务）用：图片可见就关掉它，并吃掉这次按键（本次按键不再做别的）。
++    bool DismissImageIfVisible() {
++        if (!IsImageVisible()) {
++            return false;
++        }
++        Application::GetInstance().Schedule([this]() { HideImageNow(); });
++        return true;
++    }
++
++    // RGB565 写成 LVGL 原生小端两字节（低字节在前）。
++    // 不要在这里按 SPI 屏做字节交换：flush 时由 LVGL port 的 swap_bytes 统一处理，
++    // 源数据必须保持 LVGL 原生顺序（详见 0006 的补丁说明与 README §3.2）。
++    static void Put565(uint8_t* dst, uint16_t v) {
++        dst[0] = (uint8_t)(v & 0xFF);
++        dst[1] = (uint8_t)(v >> 8);
++    }
++
++    static uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
++        return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
++    }
++
++    // 阶段 0 自检：本机生成色条，不联网、不依赖服务端。
++    // 判读：颜色与排列都对 → 图层 / 字节序 / 格式三者同时成立；
++    //       红蓝互换 → 通道映射；横向条纹错位 → stride；什么都没有 → 图层问题。
++    ToolResult ShowTestPattern() {
++        if (display_ == nullptr) {
++            return std::unexpected("本设备没有可用的屏幕");
++        }
++        const int w = kTestPatternWidth;
++        const int h = kTestPatternHeight;
++        const size_t bytes = (size_t)w * (size_t)h * 2;
++
++        ESP_LOGI(TAG, "[IMG] test pattern %dx%d rgb565 need=%u; heap free=%u largest=%u", w, h,
++                 (unsigned)bytes, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++        uint8_t* raw = static_cast<uint8_t*>(heap_caps_malloc_prefer(
++            bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
++        if (raw == nullptr) {
++            ESP_LOGE(TAG, "[IMG] test pattern malloc(%u) FAILED; largest=%u", (unsigned)bytes,
++                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++            return std::unexpected("内存不足，无法生成测试图案");
++        }
++        ESP_LOGI(TAG, "[IMG] malloc ok; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++
++        // 上 1/4：8 条等宽竖带 R G B W K Y C M（判红蓝互换与通道顺序）
++        // 中 1/2：R / G / B 三条横渐变（判通道映射）
++        // 下 1/4：16 级灰阶（判位深与高低位错位）
++        static const uint8_t kBarRgb[8][3] = {
++            {255, 0, 0},   {0, 255, 0},   {0, 0, 255},   {255, 255, 255},
++            {0, 0, 0},     {255, 255, 0}, {0, 255, 255}, {255, 0, 255},
++        };
++        const int bars_end = h / 4;
++        const int bands_end = h * 3 / 4;
++        for (int y = 0; y < h; ++y) {
++            for (int x = 0; x < w; ++x) {
++                uint16_t v;
++                if (y < bars_end) {
++                    int idx = x * 8 / w;
++                    if (idx > 7) {
++                        idx = 7;
++                    }
++                    v = Rgb565(kBarRgb[idx][0], kBarRgb[idx][1], kBarRgb[idx][2]);
++                } else if (y < bands_end) {
++                    const int band = (y - bars_end) * 3 / (bands_end - bars_end);
++                    const uint8_t level = (uint8_t)(w > 1 ? x * 255 / (w - 1) : 0);
++                    v = band == 0 ? Rgb565(level, 0, 0)
++                                  : (band == 1 ? Rgb565(0, level, 0) : Rgb565(0, 0, level));
++                } else {
++                    const uint8_t level = (uint8_t)((x * 16 / w) * 17);
++                    v = Rgb565(level, level, level);
++                }
++                Put565(raw + ((size_t)y * w + x) * 2, v);
++            }
++        }
++
++        auto image = std::make_unique<LvglAllocatedImage>(raw, bytes, w, h, w * 2,
++                                                          LV_COLOR_FORMAT_RGB565);
++        if (!image->IsValid() || !display_->ShowFullscreenImage(std::move(image))) {
++            // 失败时 image 仍在作用域内，析构会 heap_caps_free(raw)，不会漏。
++            return std::unexpected("屏幕层拒绝了测试图案");
++        }
++        image_shown_at_us_ = esp_timer_get_time();
++        return std::string("已在设备屏幕上显示彩色测试图案（按任意键关闭）");
++    }
++
++    // 阶段 1：下载一张 RGB565 原始像素直链并全屏显示。
++    //
++    // 文件格式 v1（头在**尾部**，10 字节）：
++    //     [0 .. len-11]  RGB565 像素 w*h*2 字节（小端）
++    //     [len-10..-5]   ASCII "R5G6B5"
++    //     [len-4..-3]    宽 w，小端 16 位
++    //     [len-2..-1]    高 h，小端 16 位
++    // 头放尾部的原因：LvglAllocatedImage 的析构会 heap_caps_free(image_dsc_.data)，
++    // data 必须是 malloc 的基地址 —— 头放尾部，像素才正好从基地址开始，
++    // 于是可以「下载块直接当像素块」，不需要第二次分配、也不需要 memcpy。
++    ToolResult ShowImageFromUrl(const std::string& url) {
++        if (display_ == nullptr) {
++            return std::unexpected("本设备没有可用的屏幕");
++        }
++        if (url.empty()) {
++            return std::unexpected("图片地址不能为空");
++        }
++        if (url.compare(0, 7, "http://") != 0) {
++            if (url.compare(0, 8, "https://") == 0) {
++                return std::unexpected(
++                    "图片地址必须是明文 http：本设备无 PSRAM，https 收包要 16,749 字节连续内存，"
++                    "必然中途断流");
++            }
++            return std::unexpected("图片地址必须以 http:// 开头");
++        }
++        // 先释放上一张：绝不允许「上一张还没释放就分配下一张」。
++        if (IsImageVisible()) {
++            ESP_LOGI(TAG, "[IMG] releasing the previous image before the next download");
++            HideImageNow();
++        }
++
++        auto network = Board::GetInstance().GetNetwork();
++        if (network == nullptr) {
++            return std::unexpected("设备当前没有网络");
++        }
++        auto http = network->CreateHttp(10);
++        if (http == nullptr) {
++            return std::unexpected("无法创建 HTTP 连接");
++        }
++        ESP_LOGI(TAG, "[IMG] GET %s", url.c_str());
++        if (auto opened = http->Open("GET", url); !opened) {
++            return std::unexpected("打开图片地址失败: " + opened.error().ToString());
++        }
++        auto status = http->GetStatusCode();
++        if (!status) {
++            http->Close();
++            return std::unexpected(status.error().ToString());
++        }
++        if (*status != 200) {
++            http->Close();
++            return std::unexpected("图片地址返回 " + std::to_string(*status) + "，只接受 200");
++        }
++
++        const size_t len = http->GetBodyLength();
++        const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
++        ESP_LOGI(TAG, "[IMG] len=%u; heap free=%u largest=%u", (unsigned)len,
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)largest);
++        if (len < 10 || len > kMaxImageBytes) {
++            http->Close();
++            return std::unexpected("图片体积异常（" + std::to_string(len) + " 字节），本设备单张上限 " +
++                                   std::to_string((unsigned)kMaxImageBytes) + " 字节");
++        }
++        if (largest < len + 2048) {
++            http->Close();
++            return std::unexpected("设备当前没有足够的连续内存放这张图：需要 " +
++                                   std::to_string(len) + " 字节连续，当前最大 " +
++                                   std::to_string(largest) + " 字节。稍后再试。");
++        }
++
++        // 一次分配，读进来的就是最终像素缓冲（有 PSRAM 的板自动先用 PSRAM）。
++        uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc_prefer(
++            len, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
++        if (buf == nullptr) {
++            http->Close();
++            ESP_LOGE(TAG, "[IMG] malloc(%u) FAILED; largest=%u", (unsigned)len, (unsigned)largest);
++            return std::unexpected("分配图片内存失败");
++        }
++        size_t total = 0;
++        while (total < len) {
++            auto read = http->Read(reinterpret_cast<char*>(buf) + total, len - total);
++            if (!read) {
++                heap_caps_free(buf);
++                http->Close();
++                return std::unexpected("下载图片失败");
++            }
++            if (*read == 0) {
++                break;
++            }
++            total += (size_t)*read;
++        }
++        http->Close();
++        if (total != len) {
++            heap_caps_free(buf);
++            ESP_LOGE(TAG, "[IMG] short read: %u/%u", (unsigned)total, (unsigned)len);
++            return std::unexpected("图片下载不完整");
++        }
++
++        const uint8_t* tail = buf + len - 10;
++        if (std::memcmp(tail, "R5G6B5", 6) != 0) {
++            heap_caps_free(buf);
++            return std::unexpected("这不是本设备认识的图片格式（尾部缺少 R5G6B5 标记）");
++        }
++        const int w = tail[6] | (tail[7] << 8);
++        const int h = tail[8] | (tail[9] << 8);
++        if (w <= 0 || h <= 0 || (size_t)w * (size_t)h * 2 + 10 != len) {
++            heap_caps_free(buf);
++            ESP_LOGE(TAG, "[IMG] bad geometry: %dx%d for %u bytes", w, h, (unsigned)len);
++            return std::unexpected("图片尺寸与数据长度不一致");
++        }
++        ESP_LOGI(TAG, "[IMG] tail header ok: R5G6B5 %dx%d, %u bytes", w, h, (unsigned)len);
++
++        auto image = std::make_unique<LvglAllocatedImage>(buf, len, w, h, w * 2,
++                                                          LV_COLOR_FORMAT_RGB565);
++        if (!image->IsValid() || !display_->ShowFullscreenImage(std::move(image))) {
++            // 失败时 image 析构会 heap_caps_free(buf)。
++            return std::unexpected("屏幕层拒绝了这张图");
++        }
++        image_shown_at_us_ = esp_timer_get_time();
++        ESP_LOGI(TAG, "[IMG] shown; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++        return std::string("图片已显示在设备屏幕上（按任意键关闭）");
++    }
++
++    ToolResult HideImageTool() {
++        if (!IsImageVisible()) {
++            return std::string("屏幕当前没有全屏图片");
++        }
++        HideImageNow();
++        return std::string("已关闭全屏图片");
++    }
++
+     // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
+     // exit callback while it is in its sleep stage, which is exactly from the dim
+     // deadline on, so this one path serves both stages.
+@@ -1227,16 +1549,55 @@ public:
+             "格式不符会完全没有声音。"
+             "播放会打断当前对话，播放期间不能同时对话，播完自动回到待机。",
+             PropertyList({Property("url", kPropertyTypeString)}),
+-            [](const PropertyList& properties) -> ToolResult {
++            [this](const PropertyList& properties) -> ToolResult {
+                 const auto url = properties["url"].value<std::string>();
+                 if (url.empty()) {
+                     return std::unexpected("url 不能为空");
+                 }
++                // [图片回显] 故事要用**连续**内存下载，先把全屏图片的像素块还回去。
++                // 放在 PlayAudioUrl 之前，保证故事第一次分配时不与图片争内存。
++                HideImageNow();
+                 if (!Application::GetInstance().PlayAudioUrl(url)) {
+                     return std::unexpected("设备当前无法开始播放，请稍后再试");
+                 }
+                 return std::string("已开始播放音频");
+             });
++
++        // -------------------------------------------------------------------
++        // [本地补丁 · 图片回显] 全屏图片工具
++        //
++        // 为什么只给一个 url 参数、不另外给 base64 的 data：交接文档的实测结论是
++        // 「一个返回里同时带两种数据时，模型会优先用熟悉的那个」，所以这里只留
++        // 一种数据形态，模型没有可错选的对象。
++        //
++        // 为什么不走 https：本板无 PSRAM，TLS 收包要 16,749 字节连续堆，播放/显示中
++        // 必然断流（2026-10-09 实测故事拉到 32 KB 就断）。ShowImageFromUrl 会明确拒绝
++        // https 并说明理由，不让它变成无头案。
++        // -------------------------------------------------------------------
++        mcp_server.AddTool(
++            "self.screen.show_test_pattern",
++            "在设备屏幕上显示一张本机生成的彩色测试图案（不需要联网）。"
++            "用于确认屏幕显示链路是否正常。显示期间屏幕保持常亮，按任意键关闭。",
++            PropertyList(),
++            [this](const PropertyList&) -> ToolResult { return ShowTestPattern(); });
++
++        mcp_server.AddTool(
++            "self.screen.show_image",
++            "把一张图片显示在设备屏幕上。url 必须是以 http:// 开头的直链，"
++            "内容是设备认识的 RGB565 原始像素文件（R5G6B5 格式，约 120x160）。"
++            "设备会把像素直接放进显存，不解码 JPEG/PNG。"
++            "https 地址在本设备上必然失败，不要使用。"
++            "显示期间屏幕保持常亮，按任意键关闭。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                return ShowImageFromUrl(properties["url"].value<std::string>());
++            });
++
++        mcp_server.AddTool(
++            "self.screen.hide_image",
++            "关闭屏幕上的全屏图片，回到正常的对话界面。按机身任意键也能关闭。",
++            PropertyList(),
++            [this](const PropertyList&) -> ToolResult { return HideImageTool(); });
+     }
+ 
+     virtual AudioCodec* GetAudioCodec() override {
+-- 
+2.50.1 (Apple Git-155)
+

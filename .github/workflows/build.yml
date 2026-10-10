@@ -70,7 +70,7 @@ jobs:
           grep -n 'PROJECT_VER' CMakeLists.txt | head -2
           grep -q 'set(PROJECT_VER "9.9.9")' CMakeLists.txt || {
             echo "::error::PROJECT_VER 未抬高，固件会被官方 OTA 覆盖"; exit 1; }
-          echo "===== 新增 MCP 工具（应列出 3 个）====="
+          echo "===== 新增 MCP 工具（应列出 4 个：audio.play_url / screen.show_image / screen.show_test_pattern / screen.hide_image）====="
           grep -oE '"self\.(audio|screen)\.[a-z_]+"' \
             main/boards/folotoy/ai-passport/ai_passport_board.cc | sort -u
           echo "===== 板型仍被构建脚本识别 ====="
@@ -106,8 +106,10 @@ jobs:
           name: AI Passport custom firmware #${{ github.run_number }}
           body: |
             基线：78/xiaozhi-esp32 @ main 0d576d3
-            补丁：0001~0005（含 PROJECT_VER 抬到 9.9.9）
+            补丁：0001~0007（0006 全屏图片层，板无关；0007 本板图片工具；含 PROJECT_VER 抬到 9.9.9）
             提交：${{ github.sha }}
-            工具：self.audio.play_url / self.screen.show_image / self.screen.hide_image
-            烧录：见 README；起始地址 0x0，烧录后 NVS 被清空，需重新配网
+            工具：self.audio.play_url / self.screen.show_test_pattern / self.screen.show_image / self.screen.hide_image
+            烧录：见 README；起始地址 0x0。建议用 firmware/bin/刷写固件.command 或
+            firmware/tools/flash_ai_passport.sh，两者都会先备份并写回 NVS(0x9000/0x4000)，
+            免重新配网；merged-binary 直接烧 0x0 会清空 NVS。
           files: src/build/merged-binary.bin

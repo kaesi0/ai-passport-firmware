@@ -13,27 +13,92 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 | 版本 | `PROJECT_VER=9.9.9`（挡住官方 OTA 覆盖） |
 | 镜像 | `espressif/idf:v6.1` |
 
+## 补丁
+
+按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`。
+
+| 补丁 | 层级 | 内容 |
+|---|---|---|
+| `0001-audio-play-url-board-agnostic.patch` | 板无关 | `Application::PlayAudioUrl()`：进官方 `Notifying` 态播放网络音频，云端收尾打不断它 |
+| `0002-ai-passport-audio-play-url.patch` | 板级 | 注册 `self.audio.play_url` |
+| `0003-heap-stats-largest-free-block.patch` | 板无关 | 诊断：`SystemInfo` 多打一个 `largest block`（无 PSRAM 的板只看 free sram 会误判） |
+| `0004-ai-passport-playback-screen-off.patch` | 板级 | 长音频播放期间熄屏省电；按键点亮 |
+| `0005-ai-passport-project-ver-9.9.9.patch` | 版本 | `PROJECT_VER` → `9.9.9` |
+| `0006-fullscreen-image-layer-board-agnostic.patch` | **板无关** | 常驻全屏图片层 `ShowFullscreenImage/HideFullscreenImage`，`scale=0` 自动按面板尺寸等比铺满 |
+| `0007-ai-passport-image-tools.patch` | 板级 | 图片工具 `show_test_pattern` / `show_image` / `hide_image` |
+
 ## 相对官方固件新增的模型可见工具
 
 | 工具 | 作用 |
 |---|---|
 | `self.audio.play_url` | 播放 URL 上的单声道 Ogg Opus，采样率 24000 Hz |
-| `self.screen.show_image` | 全屏显示 URL 图片（PNG 走 LVGL，JPEG 走固件解码器） |
+| `self.screen.show_test_pattern` | 本机生成 120×160 彩色测试图案（不联网），用于自检屏幕链路 |
+| `self.screen.show_image` | 全屏显示 `http://` 直链上的 **RGB565 原始像素**文件 |
 | `self.screen.hide_image` | 关闭全屏图片；按机身任意键也可以退出 |
 
-音频必须是单声道 Ogg Opus、24000 Hz，否则设备静默不出声。图片下载不超过 128KB，解码后 RGB565 不超过 120KB。
+### 音频
+
+必须是**单声道 Ogg Opus、24000 Hz**；立体声会被直接中止（不降混），本板无 MP3 解码器。
+格式不符时设备**不报错、只是没有声音**。地址一律用明文 `http`：本板无 PSRAM，TLS 收包要
+16,749 字节连续堆，播放中必然中途断流。
+
+### 图片
+
+图片走「原始像素直传」，设备**不做任何解码**，因此**不是** PNG/JPEG。文件格式（v1）：
+
+```
+偏移           内容
+0      ..  N-11   RGB565 像素，w*h*2 字节，小端（LVGL 原生顺序）
+N-10   ..  N-5    ASCII "R5G6B5"
+N-4    ..  N-3    宽 w，小端 16 位
+N-2    ..  N-1    高 h，小端 16 位
+```
+
+头放在**尾部**是刻意的：固件的 `LvglAllocatedImage` 析构会对数据指针做 `heap_caps_free`，
+指针必须是 `malloc` 的基地址；头放尾部才能「下载块直接当像素块」，零拷贝、零第二缓冲。
+
+- 地址必须是明文 `http://`（理由同音频；固件会明确拒绝 `https`）。
+- 默认 120×160（38,400 字节），LVGL 自动放大 2 倍铺满 240×320。
+- 显示前会用 `largest block`（最大连续空闲块）预检，不够时**返回可读错误**而不是黑屏。
+- 显示期间屏幕保持常亮，最长 5 分钟后自动关闭；有 PSRAM 的板只要调大板级
+  `kMaxImageBytes` 并用更大的源图档即可，显示层（`0006`）不需要改。
 
 ## 产物
 
 Actions 成功后，Release（`fw-<run_number>`）和 Artifacts 里都有 `merged-binary.bin`。
+Artifact 是 zip，**不是可烧录文件**；烧 Release 附件里的那份。
 
 ## 烧录
 
-合并固件从 `0x0` 起烧。本板是 USB Serial/JTAG，插上 USB 即可。**NVS 会被清空，烧录后必须重新配网。**
+合并固件从 `0x0` 起烧，覆盖到 `0x743fff`，会涂掉 `0x9000` 起的 NVS。推荐用配方仓同级的
+刷写向导/脚本（先备份 NVS，烧完写回，免重新配网）：
+
+```bash
+# firmware/bin/刷写固件.command（双击）或：
+firmware/tools/flash_ai_passport.sh <merged-binary.bin>
+```
+
+手动等价命令（**会清空 NVS，烧完必须重新配网**）：
 
 ```bash
 python -m esptool --chip esp32c3 -p /dev/cu.usbmodem* -b 921600 \
-  write_flash 0x0 merged-binary.bin
+  write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB 0x0 merged-binary.bin
+# 最后那次 write_flash 若用了 --before no_reset，必须再跑一条 default-reset 的命令
+# （如 read-mac），否则芯片会留在 flasher stub 里，串口一行不打印，很像刷坏了。
 ```
 
 连接失败时把波特率降到 `-b 115200`。
+
+## 复验
+
+改补丁后必须在**全新干净副本**上从基线起逐份 `git am` 全部通过再推本仓：
+
+```bash
+BASE=0d576d3d4c049c6f55eaf879725dc23e516511b4
+git clone https://github.com/78/xiaozhi-esp32.git fresh && cd fresh
+git checkout "$BASE"
+for p in ../patches/*.patch; do git am "$p" || exit 1; done
+git diff --shortstat "$BASE"   # 0001~0007 累计应为 9 files changed, 906 insertions(+), 5 deletions(-)
+```
+
+不要手工编辑 `.patch`：在已打好依赖补丁的副本里改源码，再 `git format-patch` 导出。
