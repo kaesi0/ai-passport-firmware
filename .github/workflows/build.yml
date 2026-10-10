@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 10 patches)
+    name: Build folotoy/ai-passport (xiaozhi-esp32 @ 0d576d3 + 单一基线补丁)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.1
@@ -46,7 +46,9 @@ jobs:
           cd src
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 字典序即 0001 → 0010，顺序不能乱（0002 依赖 0001，0004 依赖 0002，0007 依赖 0002 与 0006）
+          # 现行只有一个补丁：patches/0001-ai-passport-baseline.patch（= 全部本地改造，含 fw-26 状态）。
+          # 后续改动方式见配方仓 README「怎么改」与 firmware/patches/README.md。
+          # 循环保留成通配形式：加/减补丁都不用改这里（history/ 与 _removed/ 是非递归 glob 之外的，不会被带上）
           for p in ../recipe/patches/*.patch; do
             echo ">>> $(basename "$p")"
             if git am "$p"; then

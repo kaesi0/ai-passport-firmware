@@ -20,7 +20,7 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 
 - **为什么不能固定成 9.9.9**：那样无法从设备上确认当前跑的是哪一版——排查时必须先知道固件版本，
   否则「设备上到底是哪一版」只能靠读 flash 指纹反查。
-- **怎么落地**：补丁 `0005` 只设**基线** `9.9.0`（保证任何本地/手动构建都不会被官方 OTA 覆盖）；
+- **怎么落地**：补丁 基线补丁只设 `PROJECT_VER` 基线 `9.9.0`（保证任何本地/手动构建都不会被官方 OTA 覆盖）；
   发布构建由 workflow 的 `Stamp firmware version` 步骤 `sed` 注入 `9.9.${{ github.run_number }}`，
   并在 `Sanity checks` 里断言它确实等于 `9.9.<run_number>`（不等就直接失败，不产出固件）。
 - **约束**：版本号必须 **≥ 云端版本**（本板云端是 `2.5.1`）且**单调不减**，否则会被官方 OTA 覆盖回 `2.5.1`。
@@ -30,20 +30,19 @@ FoloToy `ai-passport`（ESP32-C3 / 8MB / 无 PSRAM / 240×320）的小智固件�
 
 ## 补丁
 
-按序号打，顺序不能乱。`0002` 依赖 `0001`，`0004` 依赖 `0002`，`0007` 依赖 `0002` 与 `0006`；`0003`/`0005`/`0008`/`0009`/`0010` 独立。
+**现行只有一个补丁：`patches/0001-ai-passport-baseline.patch`** —— 它等于 FoloToy AI Passport 上
+**全部现行本地改造**（合并前的分步链 `0001`~`0010` 冻结在项目仓 `firmware/patches/history/`，
+云编译不读那里）。累计 `10 files changed, 1021 insertions(+), 17 deletions(-)`（对上游 `0d576d3`）。
 
-| 补丁 | 层级 | 内容 |
-|---|---|---|
-| `0001-audio-play-url-board-agnostic.patch` | 板无关 | `Application::PlayAudioUrl()`：进官方 `Notifying` 态播放网络音频，云端收尾打不断它。**本仓用的是 fw-19 修订**（见下） |
-| `0002-ai-passport-audio-play-url.patch` | 板级 | 注册 `self.audio.play_url` |
-| `0003-heap-stats-largest-free-block.patch` | 板无关 | 诊断：`SystemInfo` 多打一个 `largest block`（无 PSRAM 的板只看 free sram 会误判） |
-| `0004-ai-passport-playback-screen-off.patch` | 板级 | 长音频播放期间熄屏省电；按键点亮 |
-| `0005-ai-passport-project-ver.patch` | 版本 | 把上游 `PROJECT_VER`（`2.5.1`）抬成**基线 `9.9.0`**，防官方 OTA 覆盖；**发布构建的版本号由 workflow 注入**（见「版本号规则」） |
-| `0006-fullscreen-image-layer-board-agnostic.patch` | **板无关** | 常驻全屏图片层 `ShowFullscreenImage/HideFullscreenImage`，`scale=0` 自动按面板尺寸等比铺满 |
-| `0007-ai-passport-image-tools.patch` | 板级 | 图片工具 `show_test_pattern` / `show_image` / `hide_image` |
-| `0008-notify-player-range-resume.patch` | 板无关 | `NotifyPlayer` 抗链路抖动：读超时 5s→10s；读失败/服务端提前关闭时用 `Range` 从**已消费字节**续传，喂同一个 `OggDemuxer`（不丢 OpusHead/解析状态） |
-| `0010-audio-keep-radio-awake.patch` | 板无关 | 播放故事期间**不把射频降到 modem sleep**：`OnAudioChannelClosed` 里那句降档移到 `Notifying` 守卫内。真机实测降档后 109 秒出现 10 秒 stall → 丢段 |
-| `0009-notify-player-resume-retry.patch` | 板无关 | 续传**带退避重试**：链路整体断掉时第一次重连必然失败，改为时间窗 60 s / 最多 20 次 / 每次失败等 1.5 s；失败与放弃都打日志 |
+包含十项：① 板无关 `PlayAudioUrl()`（进 `Notifying` 态播放、云端收尾打不断）② 板级注册音频工具
+③ 诊断 `largest block` ④ 播放期间熄屏 ⑤ `PROJECT_VER` 基线 `9.9.0` ⑥ 板无关全屏图片层（自动铺满）
+⑦ 板级三个图片工具 ⑧ `NotifyPlayer` 读超时 10s + `Range` 续传 ⑨ 续传带退避重试
+⑩ 播放期间不降射频档。**每项的来龙去脉与"为什么必须这样"见项目仓
+`firmware/patches/README.md` 与 `firmware/patches/history/`。**
+
+**怎么改**（详细命令见项目仓 `firmware/patches/README.md`）：干净副本打基线 → 改源码 → 提交 →
+`git format-patch -1` 覆盖成新基线 → **另一份全新副本 `git am` 复验** → 推本仓 → Actions 出 `fw-N`
+→ 真机验证 → 验证通过后把旧基线归档到 `history/`。
 
 ## 相对官方固件新增的模型可见工具
 

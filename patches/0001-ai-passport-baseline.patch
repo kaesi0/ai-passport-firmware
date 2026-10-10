@@ -1,0 +1,1337 @@
+From e47445ecfc3b99684a3eb069dcb5b4c775a42509 Mon Sep 17 00:00:00 2001
+From: ai-passport recipe <recipe@localhost>
+Date: Sat, 10 Oct 2026 14:30:55 +0800
+Subject: [PATCH] =?UTF-8?q?feat(ai-passport):=20=E5=8D=95=E4=B8=80?=
+ =?UTF-8?q?=E5=9F=BA=E7=BA=BF=20=E2=80=94=E2=80=94=20=E6=9C=AC=E5=9C=B0?=
+ =?UTF-8?q?=E5=85=A8=E9=83=A8=E6=94=B9=E9=80=A0=EF=BC=88=E5=AF=B9=E5=BA=94?=
+ =?UTF-8?q?=20fw-26=20/=20=E7=89=88=E6=9C=AC=E5=8F=B7=209.9.26=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+一条补丁 = FoloToy AI Passport 上全部现行本地改造，替代原先 0001~0010 的分步链。
+分步链冻结在 `firmware/patches/history/`（含每份的用途），云编译只打本基线。
+
+上游基线：78/xiaozhi-esp32 main @ 0d576d3d4c049c6f55eaf879725dc23e516511b4
+
+包含（原先的补丁 → 内容）：
+  0001 板无关 Application::PlayAudioUrl()：进官方 Notifying 态播放网络音频，云端会话收尾
+       打不断它；播放期间丢弃云端 TTS、其文字不上屏
+  0002 板级注册 self.audio.play_url
+  0003 板无关诊断：SystemInfo 多打一个 largest block（本板无 PSRAM，只看 free sram 会误判）
+  0004 板级：长音频播放期间熄屏省电（只关屏幕，不碰音频/编解码器/射频），按键点亮
+  0005 版本号基线：PROJECT_VER 2.5.1 -> 9.9.0（发布构建由 workflow 注入 9.9.<run_number>）
+  0006 板无关常驻全屏图片层（scale=0 时按面板尺寸自动等比铺满，不写死分辨率）
+  0007 板级图片工具 show_test_pattern / show_image / hide_image
+  0008 板无关 NotifyPlayer 抗链路抖动：读超时 5s->10s；读失败/服务端提前关闭时用
+       Range: bytes=<已消费字节>- 续传，喂同一个 OggDemuxer（不丢 OpusHead 与解析状态）
+  0009 板无关续传带退避重试：链路整体断掉时第一次重连必然失败，窗口 60s / 最多 20 次
+  0010 板无关：播放故事期间不把射频降到 modem sleep（降档移进 Notifying 守卫内）
+
+累计：10 files changed, 1021 insertions(+), 17 deletions(-)（对 0d576d3）
+
+后续改动方式：在本基线上改 → 提交 → `git format-patch -1` 得到新补丁 → 干净副本
+`git am` 复验 → 推配方仓 → 出 fw-N。**验证发布后把本基线重新 squash 成新基线**
+（旧基线归档到 history/），这样基线恒等于"当前已验证的完整状态"。
+---
+ CMakeLists.txt                                |   2 +-
+ main/application.cc                           | 130 +++-
+ main/application.h                            |  17 +
+ .../folotoy/ai-passport/ai_passport_board.cc  | 589 ++++++++++++++++++
+ main/display/display.cc                       |   8 +
+ main/display/display.h                        |  27 +
+ main/display/lcd_display.cc                   | 123 ++++
+ main/display/lcd_display.h                    |  13 +
+ main/notify/notify_player.cc                  | 121 +++-
+ main/system_info.cc                           |   8 +-
+ 10 files changed, 1021 insertions(+), 17 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1a409e8..234eec9 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.1")
++set(PROJECT_VER "9.9.0")
+ project(xiaozhi)
+diff --git a/main/application.cc b/main/application.cc
+index 31de205..b500aab 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -568,8 +568,18 @@ void Application::InitializeProtocol() {
+     });
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
+-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+-        Schedule([this]() {
++        Schedule([this, &board]() {
++            // The cloud closes the conversation after its spoken reply. A story
++            // already playing must survive that; otherwise it stops immediately.
++            if (GetDeviceState() == kDeviceStateNotifying) {
++                // [本地补丁] 射频档位也不能降。故事还要继续下载/播放好几分钟，掉进
++                // Wi-Fi 省电（modem sleep）会拉长唤醒延迟 —— 实测（fw-24，2026-10-10）：
++                // 云端会话收尾降档后 109 秒，正在下载的 OSS 流出现 **10 秒 stall**
++                // → `Wait for HTTP content receive timeout` → 整段丢弃。
++                // 故事真正结束后由闲置省电（软休眠）或下一次通道关闭负责降档（≤360 秒）。
++                return;
++            }
++            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -623,6 +633,12 @@ void Application::InitializeProtocol() {
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
+                 Schedule([this]() {
++                    // A cloud goodbye arrives as another TTS turn. It must not
++                    // replace a story that is already playing.
++                    if (GetDeviceState() == kDeviceStateNotifying) {
++                        ESP_LOGI(TAG, "Ignoring cloud TTS while a story is playing");
++                        return;
++                    }
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+@@ -645,8 +661,17 @@ void Application::InitializeProtocol() {
+                         glyphs.clear();
+                     }
+                     ESP_LOGI(TAG, "<< %s", text->valuestring);
+-                    Schedule([display, message = std::string(text->valuestring),
++                    // [本地补丁] 故事播放期间（Notifying）云端的句子一律不上屏。
++                    // 这时候云端来的都是会话收尾的道别（「好啦，那我就先不打扰你啦，拜拜！」），
++                    // 它的音频已经被丢弃、不会打断故事，但把文字盖到屏幕上会让人以为故事被它打断了，
++                    // 而且会把之前留在屏上的报幕文案顶掉。报幕走的是 Speaking，不受影响。
++                    // 串口仍然照原样留 `<< ` 一行，便于排查。
++                    Schedule([this, display, message = std::string(text->valuestring),
+                               glyphs = std::move(glyphs), bpp]() {
++                        if (GetDeviceState() == kDeviceStateNotifying) {
++                            ESP_LOGI(TAG, "Keeping the story screen: cloud sentence not shown");
++                            return;
++                        }
+                         display->AddTextGlyphs(glyphs, bpp);
+                         display->SetChatMessage("assistant", message.c_str());
+                     });
+@@ -1098,6 +1123,105 @@ void Application::ConfigureWakeWordForListening() {
+ #endif
+ }
+ 
++// ============================================================================
++// [本地补丁] 对话中主动播报音频（板级 MCP 工具 self.audio.play_url 的落点）
++//
++// 为什么不能直接调 StartNotification：
++//   1) 它的首行门禁是 `GetDeviceState() != kDeviceStateIdle -> return`（静默丢弃），
++//      而 MCP 工具被调用时设备必然处于 Listening/Speaking（用户刚说完话，服务端
++//      正在处理），因此请求 100% 被丢掉，且只留一行 ESP_LOGW。
++//   2) 状态机不允许 Listening/Speaking 直接转入 Notifying——它们只能回到 Idle
++//      （device_state_machine.cc:87-95：Listening -> Speaking|Idle，
++//       Speaking -> Listening|Idle；而 Notifying 只接受从 Idle 进入）。
++//      所以先显式腾挪回 Idle，再自己走 Idle -> Notifying。
++//
++// ★ 故事必须真的进入 Notifying（2026-10-09 真机串口实测，链条每一环都有日志）：
++//   设备留在 Idle 时，云端会话收尾的那句道别会发 `tts start`，把设备切到 Speaking；
++//   而 `HandleStateChangedEvent()` 的 kDeviceStateSpeaking 分支会调用
++//   `audio_service_.ResetDecoder()`，解码队列代次一变，下载任务的下一次
++//   `PushPacketToDecodeQueue` 立刻返回 false → 下载任务放弃整条 HTTP 流：
++//
++//       20:36:32.007 StateMachine: State: idle -> speaking
++//       20:36:32.008 HttpClient: Connection closed prematurely,
++//                    expected 774638 bytes but only received 118200 bytes
++//       20:36:32.008 NotifyPlayer: Notification playback underrun #1 at 34180 ms
++//
++//   即「放到三十几秒，云端一道别就断」。以前几版把守卫写成 `state == Notifying`
++//   却没有一处真正切进 Notifying，所以那些守卫全是死代码（fw-11~fw-14 都如此）。
++//
++// 两路声音不会打架：服务端推来的 TTS 音频包只在设备处于 kDeviceStateSpeaking 时
++// 才被投喂解码队列（application.cc 的 OnIncomingAudio）。设备在 Notifying 时，
++// 服务端的音频包被直接丢弃；服务端的 tts start/stop 也命中不了 Speaking 分支
++// （被下面的守卫挡回），因此不会打断播报。
++// ============================================================================
++bool Application::PlayAudioUrl(const std::string& url) {
++    if (url.empty()) {
++        ESP_LOGW(TAG, "PlayAudioUrl: refusing empty url");
++        return false;
++    }
++    // Official music is protected from the cloud tts-stop message because it is
++    // not in the speaking state. A story must use that same notification state.
++    if (GetDeviceState() == kDeviceStateSpeaking) {
++        AbortSpeaking(kAbortReasonNone);
++    } else if (GetDeviceState() == kDeviceStateNotifying) {
++        StopNotification();
++    }
++    if (GetDeviceState() != kDeviceStateIdle &&
++        !SetDeviceState(kDeviceStateIdle)) {
++        ESP_LOGE(TAG, "PlayAudioUrl: cannot return to idle");
++        return false;
++    }
++
++    // 上一次播报的下载任务可能还在收尾（Stop() 只置位，worker 要跑完当前一轮才退），
++    // 而 NotifyPlayer::Start() 见到 worker_running_ 会直接返回 false。这里只等一个有界
++    // 的短时间，避免把主任务长时间占住；等不到就当作启动失败，让调用方看到明确结果。
++    if (notify_player_.IsBusy()) {
++        notify_player_.Stop();
++        for (int i = 0; i < 20 && notify_player_.IsBusy(); ++i) {
++            vTaskDelay(pdMS_TO_TICKS(10));
++        }
++        if (notify_player_.IsBusy()) {
++            ESP_LOGE(TAG, "PlayAudioUrl: previous playback is still winding down");
++            return false;
++        }
++    }
++
++    // 与 StartNotification 保持一致的准备动作：播报期间关掉语音处理、放开唤醒词资源，
++    // 射频抬到 PERFORMANCE。两块声音共用同一条解码队列，这里不做区分。
++    auto& board = Board::GetInstance();
++    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++    audio_service_.EnableVoiceProcessing(false);
++    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++    audio_service_.ReleaseWakeWordResources();
++    while (audio_service_.PopPacketFromSendQueue()) {
++        // Discard microphone audio left over from a previous conversation.
++    }
++
++    if (!SetDeviceState(kDeviceStateNotifying)) {
++        ESP_LOGE(TAG, "PlayAudioUrl: cannot enter notifying");
++        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
++        return false;
++    }
++
++    audio_service_.ResetDecoder();
++    uint32_t playback_id = ++notification_playback_id_;
++    if (playback_id == 0) {
++        playback_id = ++notification_playback_id_;
++    }
++    const bool started = notify_player_.Start(
++        url, {}, playback_id, nullptr,
++        [this](uint32_t id, bool success) {
++            Schedule([this, id, success]() { HandleNotificationFinished(id, success); });
++        });
++    if (!started) {
++        ESP_LOGE(TAG, "PlayAudioUrl: download did not start");
++        StopNotification();
++        return false;
++    }
++    ESP_LOGI(TAG, "PlayAudioUrl: queued on the notification decoder");
++    return true;
++}
++
+ void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+diff --git a/main/application.h b/main/application.h
+index f2b9a00..3458c69 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -118,6 +118,23 @@ public:
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
++
++    /**
++     * [本地补丁] 播报一段网络音频（板级 MCP 工具 self.audio.play_url 的入口）
++     *
++     * 与 StartNotification 的差别：允许在对话过程中被调用——会先中断当前对话，
++     * 再进入播报态。直接调用 StartNotification 不行：MCP 工具被调用时设备必然
++     * 处于 Listening/Speaking，而它首行门禁要求 kDeviceStateIdle，会被静默丢弃；
++     * 且状态机不允许 Listening/Speaking 直接转入 Notifying。
++     *
++     * 约束（由固件决定，调用方需保证 URL 合规）：
++     *   - 单声道 Ogg Opus，采样率对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000）；
++     *   - 播报与对话共用同一条解码队列，播报期间无法对话；
++     *   - 播完自动回到 Idle，可用唤醒词中途打断（见 WakeWordInvoke）。
++     *
++     * @return true 表示已进入说话态并开始下载
++     */
++    bool PlayAudioUrl(const std::string& url);
+     
+     /**
+      * Reset protocol resources (thread-safe)
+diff --git a/main/boards/folotoy/ai-passport/ai_passport_board.cc b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+index cfe0e68..35c69f9 100644
+--- a/main/boards/folotoy/ai-passport/ai_passport_board.cc
++++ b/main/boards/folotoy/ai-passport/ai_passport_board.cc
+@@ -4,11 +4,17 @@
+ #include "application.h"
+ #include "button.h"
+ #include "config.h"
++#include "mcp_server.h"
+ #include "assets/lang_config.h"
+ #include "cw2017_battery_monitor.h"
+ #include "power_save_timer.h"
++#include "board.h"
++#include "http.h"
++#include "lvgl_image.h"
+ 
+ #include <esp_log.h>
++#include <esp_heap_caps.h>
++#include <cstring>
+ #include <esp_lcd_panel_vendor.h>
+ #include <esp_lcd_panel_ops.h>
+ #include <esp_pm.h>
+@@ -94,6 +100,56 @@ static constexpr int kStandbyCpuMinFreq = 40;
+ // wake configuration cannot leave the device asleep until the battery dies.
+ static constexpr uint64_t kFallbackWakeupUs = 60ULL * 60ULL * 1000000ULL;
+ 
++// ============================================================================
++// [本地补丁] 长音频播放时熄屏（省电），按键或重新对话时点亮。
++//
++// 为什么必须单独做一条路径：上面那三档闲置省电（60 s 调光 / 360 s 软休眠 /
++// 2160 s 深睡）**全部**以 Application::CanEnterSleepMode() 为门，而它在
++// state != Idle 时一律返回 false。也就是说故事播放（Notifying）和知识库朗读
++// （Speaking）期间屏幕会一直亮着，一集几分钟就是白白烧电——这正是本补丁要解决的。
++//
++// 这条路径**只关屏幕**：面板 display-off + sleep-in，背光归 0。它不碰音频、
++// 编解码器、I2S、CPU 频率和射频，所以播放不会因此中断或掉帧。
++//
++// 触发条件：state 处于 Speaking / Notifying，且距上次按键（或播放开始）已过
++// kPlaybackScreenOffSeconds 秒。用「距上次按键」而不是「播放一开始就关」，是为了：
++//   - 短回复（几秒）根本不会熄屏，只在长朗读时才熄；
++//   - 播放中按过键之后，屏幕会再亮这么久，给用户留出看清屏幕的时间。
++// 点亮条件：
++//   - 按下任意键（音量 +/-、确定）—— 走 WakeFromIdle；
++//   - 状态进入 Connecting —— 唤醒词和确定键开新会话都必经这里
++//     （Application::BeginWakeWordInvoke 里明确 SetDeviceState(kDeviceStateConnecting)），
++//     所以它精确地代表「用户又开始对话了」。
++// 刻意**不**在 Speaking -> Listening 时点亮：朗读自然结束走的就是这条路，而用户要的是
++// 「播放结束保持黑屏」。代价是「朗读中用唤醒词打断」这一种情形屏幕不亮（按键仍可点亮），
++// 因为它在状态上无法与自然结束区分。
++// 播放自然结束（回到 Idle/Listening）时保持熄灭，等按键或下一次对话再亮，这样最省电；
++// 之后 360 s 的软休眠/2160 s 的深睡仍按原逻辑接管。
++// ============================================================================
++static constexpr int kPlaybackScreenOffSeconds = 5;
++
++// ============================================================================
++// [本地补丁 · 图片回显] 全屏图片的常量
++//
++// 为什么是 120x160：本板无 PSRAM，一张 RGB565 图要 w*h*2 字节**连续**内存。
++// 真机实测（firmware/logs/*.log 的 SystemInfo 行）：
++//     开机 / 新会话空闲    largest block = 53,248 ~ 59,392（fw-20 实测 55,296）
++//     闲置调光后           largest block = 40,960
++//     Speaking 朗读中      largest block = 51,200
++//     Notifying 播放中     largest block = 7,680 ~ 21,504
++//     故事放完回流 Idle    largest block = 19,456（碎片滞留，不回收）
++// 120x160 = 38,400 字节，在「空闲最差档 40,960」之下，且 2 倍正好铺满 240x320。
++// 240x240 要 115,200 字节：整机 free sram 只有 85 KB，永远不可能成立 —— 这正是
++// 旧的 120 KB 体积红线方案的根因（见 图片回显问题修复.md §2.1）。
++// ============================================================================
++static constexpr int kTestPatternWidth = 120;
++static constexpr int kTestPatternHeight = 160;
++// 单张图的下载上限。本板用不到这么大，给有 PSRAM 的板留出余量；真正的闸门是
++// 显示前的 largest block 预检（见 ShowImageFromUrl）。
++static constexpr size_t kMaxImageBytes = 64 * 1024;
++// 图片最长停留时间：到点自动关，把官方三档闲置省电还给设备（520 mAh 电池）。
++static constexpr int kImageMaxVisibleSeconds = 300;
++
+ // ============================================================================
+ // ES8311 suspend, aligned register-for-register with the FoloToy AI Passport
+ // BSP (components/bsp/src/bsp_audio.c). The codec-dev disable path this board
+@@ -249,6 +305,24 @@ private:
+     // that lands in that window.
+     int64_t last_key_us_ = 0;
+ 
++    // [本地补丁] 播放熄屏：屏幕当前是否由这条路径关着、播放开始时刻、
++    // 以及 1 Hz 的状态轮询定时器。全部只在主任务上读写（tick 只做判断，
++    // 真正动屏幕/背光的动作都 Schedule 到主任务），详见文件顶部那段说明。
++    bool playback_screen_off_ = false;
++    bool was_playing_ = false;
++    int64_t playback_started_us_ = 0;
++    int64_t last_playing_us_ = 0;
++    esp_timer_handle_t playback_screen_timer_ = nullptr;
++
++    // [本地补丁 · 图片回显] 全屏图片的显示时刻（0 = 当前没有图片）。
++    //
++    // **为什么是 32 位毫秒而不是 64 位微秒**：这个值由 MCP 任务写、由 1 Hz 巡检
++    // （esp_timer 任务）读。64 位整型在 32 位 MCU 上不是单指令访问，可能撕裂——读到
++    // 「未来」的值会让 `now - shown` 变负、自动关闭永远不触发，图片就一直占着屏幕
++    // 且禁止调光/休眠，把 520mAh 电池耗干。32 位是单指令读写；比较改用无符号差值，
++    // 天然处理 49.7 天的回绕（而设备睡一次就重启，绕不到）。
++    uint32_t image_shown_ms_ = 0;
++
+     // Guards the stage transitions against a key press that arrived while they
+     // were queued: PowerSaveTimer has already forgiven that press, but the wake
+     // handler scheduled behind them has not run yet.
+@@ -415,6 +489,8 @@ private:
+         auto up = adc_button_[kAdcButtonUp];
+         up->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(10); });
+         });
+         up->OnLongPress([this]() {
+@@ -428,6 +504,8 @@ private:
+         auto down = adc_button_[kAdcButtonDown];
+         down->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() { ChangeVolume(-10); });
+         });
+         down->OnLongPress([this]() {
+@@ -441,6 +519,8 @@ private:
+         auto ok = adc_button_[kAdcButtonOk];
+         ok->OnClick([this]() {
+             if (KeyEventsBlocked()) return;
++            // [图片回显] 正在看图时，任意键先关图（吃掉本次按键，再按一次才开新会话）。
++            if (DismissImageIfVisible()) return;
+             Application::GetInstance().Schedule([this]() {
+                 // Opening the audio channel with the network down would only
+                 // raise an error alert, so show the ordinary "connecting" hint
+@@ -467,6 +547,8 @@ private:
+                     ArmWakeKeyGuard();
+                 }
+                 WakeUpPowerSaveTimer();
++                // [本地补丁] 播放熄屏与 PowerSaveTimer 无关，得自己点亮（见该函数注释）。
++                WakeScreenFromPlaybackBlank();
+             });
+             // Not released on press-up: the click that belongs to the wake press is
+             // graded a tick after it, so the guard has to outlive the release and
+@@ -559,6 +641,21 @@ private:
+         }
+     }
+ 
++    // [本地补丁] 按键点亮「播放熄屏」的屏幕。
++    //
++    // 为什么必须单独挂一次，而不是复用 WakeFromIdle()：PowerSaveTimer::WakeUp()
++    // 只在它自己 in_sleep_mode_ 为真时才回调 on_exit_sleep_mode_（→ WakeFromIdle），
++    // 而 in_sleep_mode_ 只在它的「调光档」触发时才置位；调光档在
++    // !Application::CanEnterSleepMode() 时会 `ticks_ = 0; return;`，播放态恰恰
++    // 一直是 false。所以播放期间按键根本走不到 WakeFromIdle —— fw-17 实测的现象
++    // 就是「音量键有反应、屏幕不亮」。这里直接挂在按下事件上，与状态无关。
++    void WakeScreenFromPlaybackBlank() {
++        if (!playback_screen_off_) {
++            return;
++        }
++        Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++    }
++
+     // Pin holds are latched in the RTC domain and survive the deep-sleep reset
+     // (see gpio_hold_en: the state is retained when the GPIO's power domain
+     // goes off, including Deep-sleep events). Every hold taken before sleeping
+@@ -623,6 +720,407 @@ private:
+         power_save_timer_->SetEnabled(true);
+     }
+ 
++    // ------------------------------------------------------------------
++    // [本地补丁] 长音频播放时熄屏，按键或重新开始对话时点亮。
++    // 详细理由见文件顶部 kPlaybackScreenOffSeconds 那段注释。
++    // ------------------------------------------------------------------
++    void InitializePlaybackScreenTimer() {
++        esp_timer_create_args_t args = {};
++        args.callback = [](void* arg) {
++            static_cast<AiPassportBoard*>(arg)->OnPlaybackScreenTick();
++        };
++        args.arg = this;
++        args.name = "playback_screen";
++        esp_err_t err = esp_timer_create(&args, &playback_screen_timer_);
++        if (err != ESP_OK) {
++            ESP_LOGE(TAG, "Playback screen timer create failed: %s", esp_err_to_name(err));
++            playback_screen_timer_ = nullptr;
++            return;
++        }
++        // 1 Hz：和 PowerSaveTimer 同频，判断足够细，开销可忽略。
++        esp_timer_start_periodic(playback_screen_timer_, 1000 * 1000);
++    }
++
++    // 播放态：Speaking = 云端 TTS（含 knowledge MCP 念知识库），Notifying = 有声故事。
++    bool IsPlayingAudio() const {
++        const auto state = Application::GetInstance().GetDeviceState();
++        return state == kDeviceStateSpeaking || state == kDeviceStateNotifying;
++    }
++
++    // 跑在 esp_timer 任务上，只做判断；真正动面板/背光的一律 Schedule 到主任务。
++    void OnPlaybackScreenTick() {
++        if (playback_screen_timer_ == nullptr) {
++            return;
++        }
++        const int64_t now = esp_timer_get_time();
++        const auto state = Application::GetInstance().GetDeviceState();
++
++        // ------------------------------------------------------------------
++        // [本地补丁 · 图片回显] 全屏图片的看护（与播放熄屏共用这一个 1 Hz 巡检）
++        //   1) 故事一开播就把图片释放掉，让音频下载拿到最大连续块
++        //      （兜底：音频工具入口已经同步释放过一次）；
++        //   2) 图片可见期间不调光不熄屏 —— 把闲置省电的计数一直清零；
++        //   3) 最长 kImageMaxVisibleSeconds 秒后自动关，恢复官方三档省电。
++        // 这段必须在下面各条 early-return 之前，否则播放态那两条分支会把它跳过。
++        // ------------------------------------------------------------------
++        if (IsImageVisible()) {
++            if (state == kDeviceStateNotifying) {
++                ESP_LOGI(TAG, "[IMG] story started: releasing the image for the audio download");
++                Application::GetInstance().Schedule([this]() { HideImageNow(); });
++            } else if (image_shown_ms_ != 0 &&
++                       (uint32_t)(now / 1000 - image_shown_ms_) >=
++                           (uint32_t)kImageMaxVisibleSeconds * 1000u) {
++                ESP_LOGI(TAG, "[IMG] auto-hide after %ds", kImageMaxVisibleSeconds);
++                Application::GetInstance().Schedule([this]() { HideImageNow(); });
++            } else {
++                // PowerSaveTimer::WakeUp() 只做 ticks_ = 0（并在已进调光档时点亮屏幕），
++                // 不碰音频/编解码器/CPU 频率 —— 用它把 60 s 调光与 360 s 软休眠一直推后。
++                WakeUpPowerSaveTimer();
++            }
++        }
++
++        // 「用户又开始对话」必须**先**判，且不参与下面的状态抖动容差。
++        // 唤醒词与确定键开新会话都必经 Connecting（Application::BeginWakeWordInvoke）。
++        // 如果这条判断放在 playing 分支之后，就会被「允许 <=3 秒抖动」挡住：播放刚被
++        // 打断的那几秒里 playing 仍为真，函数直接 return，屏幕不会亮（review 发现）。
++        if (playback_screen_off_ && state == kDeviceStateConnecting) {
++            ESP_LOGI(TAG, "Playback screen off: user started a new conversation, waking screen");
++            Application::GetInstance().Schedule([this]() { ExitPlaybackScreenOff(); });
++            return;
++        }
++
++        const bool state_playing =
++            state == kDeviceStateSpeaking || state == kDeviceStateNotifying;
++        if (state_playing) {
++            last_playing_us_ = now;
++        }
++        // 连续播放才算「一段播放」，允许 <=3 秒的状态抖动：既避免几秒的短问答被熄屏，
++        // 也避免云端若按句发 tts stop/start 时反复重置计时、导致长朗读永远不熄屏。
++        const bool playing =
++            state_playing || (last_playing_us_ != 0 && now - last_playing_us_ <= 3LL * 1000000);
++        if (playing && !was_playing_) {
++            playback_started_us_ = now;
++        }
++        was_playing_ = playing;
++
++        if (playing) {
++            // 播放态：距上次按键（或本次播放开始）够久就熄屏。用「距上次按键」
++            // 而不是「播放一开始就关」有两个好处——几秒的短问答不会熄屏；
++            // 播放中按过键之后屏幕会再亮满 kPlaybackScreenOffSeconds 秒。
++            if (!playback_screen_off_) {
++                const int64_t base =
++                    playback_started_us_ > last_key_us_ ? playback_started_us_ : last_key_us_;
++                if (now - base >= (int64_t)kPlaybackScreenOffSeconds * 1000000) {
++                    Application::GetInstance().Schedule([this]() { EnterPlaybackScreenOff(); });
++                }
++            }
++            return;
++        }
++    }
++
++    void EnterPlaybackScreenOff() {
++        if (playback_screen_off_ || soft_sleep_active_ || deep_sleep_started_) {
++            return;
++        }
++        if (!IsPlayingAudio()) {
++            return;  // 排队这一会儿播放可能已经结束了
++        }
++        // [本地补丁 · 图片回显] 用户正在看图时不熄屏（方案要求：图片可见期间不熄屏）。
++        // 巡检每秒钟还会 WakeUpPowerSaveTimer()，所以 60 s 调光也不会来。
++        if (IsImageVisible()) {
++            return;
++        }
++        playback_screen_off_ = true;
++        ESP_LOGI(TAG, "Playing: screen off after %ds without input (audio keeps running)",
++                 kPlaybackScreenOffSeconds);
++        SleepPanel();
++        GetBacklight()->SetBrightness(0);
++    }
++
++    void ExitPlaybackScreenOff() {
++        if (!playback_screen_off_) {
++            return;
++        }
++        playback_screen_off_ = false;
++        ESP_LOGI(TAG, "Playing: screen back on");
++        WakePanel();
++        GetBacklight()->RestoreBrightness();
++    }
++
++    // ------------------------------------------------------------------
++    // [本地补丁 · 图片回显] 常驻全屏图片
++    //
++    // 三个工具在 InitializeTools() 里注册：show_test_pattern / show_image / hide_image。
++    // 与显示层（补丁 0006 的 ShowFullscreenImage）的分工：显示层只管「把一块已经准备好
++    // 的像素显示出来」；本段负责「把网络上的 RGB565 直链**一次 malloc** 读进最终像素
++    // 缓冲」—— 零解码、零拷贝、零第二缓冲。这是本板无 PSRAM 前提下唯一可行的数据通路，
++    // 理由与内存账见 图片回显问题修复.md §3。
++    //
++    // 与音频的三条关系（全是为「不破坏有声故事修复」而设）：
++    //   1) self.audio.play_url 一被调用就先 HideImageNow()，把连续块立刻还给下载；
++    //   2) 1 Hz 巡检看到 Notifying 再兜底释放一次；
++    //   3) 图片可见期间 EnterPlaybackScreenOff() 直接返回，不熄屏。
++    // 本段不碰 Application::PlayAudioUrl、NotifyPlayer、音频队列、编解码器与射频。
++    // ------------------------------------------------------------------
++
++    // 图片当前是否可见。任何任务都能读（显示层用的是原子标志）。
++    bool IsImageVisible() const {
++        return display_ != nullptr && display_->IsFullscreenImageVisible();
++    }
++
++    // 关闭图片并打印释放后的堆，用来证明「像素缓冲真的还回去了」。
++    // 调用方可以是主任务，也可以是 MCP 任务（显示层自己会拿 LVGL 锁）。
++    void HideImageNow() {
++        if (!IsImageVisible()) {
++            return;
++        }
++        display_->HideFullscreenImage();
++        image_shown_ms_ = 0;
++        if (display_->IsFullscreenImageVisible()) {
++            ESP_LOGW(TAG, "[IMG] hide failed (display busy)");
++            return;
++        }
++        ESP_LOGI(TAG, "[IMG] hidden; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++    }
++
++    // 按键回调（按键任务）用：图片可见就关掉它，并吃掉这次按键（本次按键不再做别的）。
++    bool DismissImageIfVisible() {
++        if (!IsImageVisible()) {
++            return false;
++        }
++        Application::GetInstance().Schedule([this]() { HideImageNow(); });
++        return true;
++    }
++
++    // [本地补丁 · 图片回显] 把「已经关掉的面板」点亮，否则图片会显示在熄屏的面板上。
++    //
++    // 为什么必须有这一步：模型在调出图工具之前通常会先说一句（`Speaking`），而 fw-18 的
++    // 播放熄屏条件是「`Speaking`/`Notifying` 且距上次按键满 5 秒」——等火山出图的十几秒里
++    // 屏幕早就熄了。此时把图显示到已熄屏的面板上，用户什么都看不到，非得按一下键才现出来
++    // （实测判据会是：日志有 `Fullscreen image shown` 但用户报「屏幕没反应」）。
++    // 软休眠同理（闲置 360 秒后屏幕/编解码器都关了）。
++    // 两个 Exit* 都是幂等的（标志为假就直接返回），所以重复调用安全。
++    void WakeScreenForImage() {
++        WakeScreenFromPlaybackBlank();
++        if (soft_sleep_active_) {
++            Application::GetInstance().Schedule([this]() { ExitSoftSleep(); });
++        }
++    }
++
++    // RGB565 写成 LVGL 原生小端两字节（低字节在前）。
++    // 不要在这里按 SPI 屏做字节交换：flush 时由 LVGL port 的 swap_bytes 统一处理，
++    // 源数据必须保持 LVGL 原生顺序（详见 0006 的补丁说明与 README §3.2）。
++    static void Put565(uint8_t* dst, uint16_t v) {
++        dst[0] = (uint8_t)(v & 0xFF);
++        dst[1] = (uint8_t)(v >> 8);
++    }
++
++    static uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
++        return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
++    }
++
++    // 阶段 0 自检：本机生成色条，不联网、不依赖服务端。
++    // 判读：颜色与排列都对 → 图层 / 字节序 / 格式三者同时成立；
++    //       红蓝互换 → 通道映射；横向条纹错位 → stride；什么都没有 → 图层问题。
++    ToolResult ShowTestPattern() {
++        if (display_ == nullptr) {
++            return std::unexpected("本设备没有可用的屏幕");
++        }
++        const int w = kTestPatternWidth;
++        const int h = kTestPatternHeight;
++        const size_t bytes = (size_t)w * (size_t)h * 2;
++
++        ESP_LOGI(TAG, "[IMG] test pattern %dx%d rgb565 need=%u; heap free=%u largest=%u", w, h,
++                 (unsigned)bytes, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++        uint8_t* raw = static_cast<uint8_t*>(heap_caps_malloc_prefer(
++            bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
++        if (raw == nullptr) {
++            ESP_LOGE(TAG, "[IMG] test pattern malloc(%u) FAILED; largest=%u", (unsigned)bytes,
++                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++            return std::unexpected("内存不足，无法生成测试图案");
++        }
++        ESP_LOGI(TAG, "[IMG] malloc ok; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++
++        // 上 1/4：8 条等宽竖带 R G B W K Y C M（判红蓝互换与通道顺序）
++        // 中 1/2：R / G / B 三条横渐变（判通道映射）
++        // 下 1/4：16 级灰阶（判位深与高低位错位）
++        static const uint8_t kBarRgb[8][3] = {
++            {255, 0, 0},   {0, 255, 0},   {0, 0, 255},   {255, 255, 255},
++            {0, 0, 0},     {255, 255, 0}, {0, 255, 255}, {255, 0, 255},
++        };
++        const int bars_end = h / 4;
++        const int bands_end = h * 3 / 4;
++        for (int y = 0; y < h; ++y) {
++            for (int x = 0; x < w; ++x) {
++                uint16_t v;
++                if (y < bars_end) {
++                    int idx = x * 8 / w;
++                    if (idx > 7) {
++                        idx = 7;
++                    }
++                    v = Rgb565(kBarRgb[idx][0], kBarRgb[idx][1], kBarRgb[idx][2]);
++                } else if (y < bands_end) {
++                    const int band = (y - bars_end) * 3 / (bands_end - bars_end);
++                    const uint8_t level = (uint8_t)(w > 1 ? x * 255 / (w - 1) : 0);
++                    v = band == 0 ? Rgb565(level, 0, 0)
++                                  : (band == 1 ? Rgb565(0, level, 0) : Rgb565(0, 0, level));
++                } else {
++                    const uint8_t level = (uint8_t)((x * 16 / w) * 17);
++                    v = Rgb565(level, level, level);
++                }
++                Put565(raw + ((size_t)y * w + x) * 2, v);
++            }
++        }
++
++        auto image = std::make_unique<LvglAllocatedImage>(raw, bytes, w, h, w * 2,
++                                                          LV_COLOR_FORMAT_RGB565);
++        if (!image->IsValid() || !display_->ShowFullscreenImage(std::move(image))) {
++            // 失败时 image 仍在作用域内，析构会 heap_caps_free(raw)，不会漏。
++            return std::unexpected("屏幕层拒绝了测试图案");
++        }
++        image_shown_ms_ = (uint32_t)(esp_timer_get_time() / 1000);
++        WakeScreenForImage();   // 面板可能已被播放熄屏/软休眠关掉，点亮它（见该函数注释）
++        return std::string("已在设备屏幕上显示彩色测试图案（按任意键关闭）");
++    }
++
++    // 阶段 1：下载一张 RGB565 原始像素直链并全屏显示。
++    //
++    // 文件格式 v1（头在**尾部**，10 字节）：
++    //     [0 .. len-11]  RGB565 像素 w*h*2 字节（小端）
++    //     [len-10..-5]   ASCII "R5G6B5"
++    //     [len-4..-3]    宽 w，小端 16 位
++    //     [len-2..-1]    高 h，小端 16 位
++    // 头放尾部的原因：LvglAllocatedImage 的析构会 heap_caps_free(image_dsc_.data)，
++    // data 必须是 malloc 的基地址 —— 头放尾部，像素才正好从基地址开始，
++    // 于是可以「下载块直接当像素块」，不需要第二次分配、也不需要 memcpy。
++    ToolResult ShowImageFromUrl(const std::string& url) {
++        if (display_ == nullptr) {
++            return std::unexpected("本设备没有可用的屏幕");
++        }
++        if (url.empty()) {
++            return std::unexpected("图片地址不能为空");
++        }
++        if (url.compare(0, 7, "http://") != 0) {
++            if (url.compare(0, 8, "https://") == 0) {
++                return std::unexpected(
++                    "图片地址必须是明文 http：本设备无 PSRAM，https 收包要 16,749 字节连续内存，"
++                    "必然中途断流");
++            }
++            return std::unexpected("图片地址必须以 http:// 开头");
++        }
++        // 先释放上一张：绝不允许「上一张还没释放就分配下一张」。
++        if (IsImageVisible()) {
++            ESP_LOGI(TAG, "[IMG] releasing the previous image before the next download");
++            HideImageNow();
++        }
++
++        auto network = Board::GetInstance().GetNetwork();
++        if (network == nullptr) {
++            return std::unexpected("设备当前没有网络");
++        }
++        auto http = network->CreateHttp(10);
++        if (http == nullptr) {
++            return std::unexpected("无法创建 HTTP 连接");
++        }
++        ESP_LOGI(TAG, "[IMG] GET %s", url.c_str());
++        if (auto opened = http->Open("GET", url); !opened) {
++            return std::unexpected("打开图片地址失败: " + opened.error().ToString());
++        }
++        auto status = http->GetStatusCode();
++        if (!status) {
++            http->Close();
++            return std::unexpected(status.error().ToString());
++        }
++        if (*status != 200) {
++            http->Close();
++            return std::unexpected("图片地址返回 " + std::to_string(*status) + "，只接受 200");
++        }
++
++        const size_t len = http->GetBodyLength();
++        const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
++        ESP_LOGI(TAG, "[IMG] len=%u; heap free=%u largest=%u", (unsigned)len,
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned)largest);
++        if (len < 10 || len > kMaxImageBytes) {
++            http->Close();
++            return std::unexpected("图片体积异常（" + std::to_string(len) + " 字节），本设备单张上限 " +
++                                   std::to_string((unsigned)kMaxImageBytes) + " 字节");
++        }
++        if (largest < len + 2048) {
++            http->Close();
++            return std::unexpected("设备当前没有足够的连续内存放这张图：需要 " +
++                                   std::to_string(len) + " 字节连续，当前最大 " +
++                                   std::to_string(largest) + " 字节。稍后再试。");
++        }
++
++        // 一次分配，读进来的就是最终像素缓冲（有 PSRAM 的板自动先用 PSRAM）。
++        uint8_t* buf = static_cast<uint8_t*>(heap_caps_malloc_prefer(
++            len, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
++        if (buf == nullptr) {
++            http->Close();
++            ESP_LOGE(TAG, "[IMG] malloc(%u) FAILED; largest=%u", (unsigned)len, (unsigned)largest);
++            return std::unexpected("分配图片内存失败");
++        }
++        size_t total = 0;
++        while (total < len) {
++            auto read = http->Read(reinterpret_cast<char*>(buf) + total, len - total);
++            if (!read) {
++                heap_caps_free(buf);
++                http->Close();
++                return std::unexpected("下载图片失败");
++            }
++            if (*read == 0) {
++                break;
++            }
++            total += (size_t)*read;
++        }
++        http->Close();
++        if (total != len) {
++            heap_caps_free(buf);
++            ESP_LOGE(TAG, "[IMG] short read: %u/%u", (unsigned)total, (unsigned)len);
++            return std::unexpected("图片下载不完整");
++        }
++
++        const uint8_t* tail = buf + len - 10;
++        if (std::memcmp(tail, "R5G6B5", 6) != 0) {
++            heap_caps_free(buf);
++            return std::unexpected("这不是本设备认识的图片格式（尾部缺少 R5G6B5 标记）");
++        }
++        const int w = tail[6] | (tail[7] << 8);
++        const int h = tail[8] | (tail[9] << 8);
++        if (w <= 0 || h <= 0 || (size_t)w * (size_t)h * 2 + 10 != len) {
++            heap_caps_free(buf);
++            ESP_LOGE(TAG, "[IMG] bad geometry: %dx%d for %u bytes", w, h, (unsigned)len);
++            return std::unexpected("图片尺寸与数据长度不一致");
++        }
++        ESP_LOGI(TAG, "[IMG] tail header ok: R5G6B5 %dx%d, %u bytes", w, h, (unsigned)len);
++
++        auto image = std::make_unique<LvglAllocatedImage>(buf, len, w, h, w * 2,
++                                                          LV_COLOR_FORMAT_RGB565);
++        if (!image->IsValid() || !display_->ShowFullscreenImage(std::move(image))) {
++            // 失败时 image 析构会 heap_caps_free(buf)。
++            return std::unexpected("屏幕层拒绝了这张图");
++        }
++        image_shown_ms_ = (uint32_t)(esp_timer_get_time() / 1000);
++        WakeScreenForImage();   // 面板可能已被播放熄屏/软休眠关掉，点亮它（见该函数注释）
++        ESP_LOGI(TAG, "[IMG] shown; heap free=%u largest=%u",
++                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
++                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
++        return std::string("图片已显示在设备屏幕上（按任意键关闭）");
++    }
++
++    ToolResult HideImageTool() {
++        if (!IsImageVisible()) {
++            return std::string("屏幕当前没有全屏图片");
++        }
++        HideImageNow();
++        return std::string("已关闭全屏图片");
++    }
++
+     // PowerSaveTimer::WakeUp() fires on every key press-down. It only invokes the
+     // exit callback while it is in its sleep stage, which is exactly from the dim
+     // deadline on, so this one path serves both stages.
+@@ -631,6 +1129,12 @@ private:
+             ExitSoftSleep();
+             return;
+         }
++        if (playback_screen_off_) {
++            // [本地补丁] 播放中按下任意键：点亮屏幕。下一次 tick 会重新开始
++            // 计时，所以屏幕会亮满 kPlaybackScreenOffSeconds 秒再熄。
++            ExitPlaybackScreenOff();
++            return;
++        }
+         GetBacklight()->RestoreBrightness();
+     }
+ 
+@@ -691,6 +1195,10 @@ private:
+         soft_sleep_ticks_ = 0;
+         ESP_LOGI(TAG, "Input: waking from soft sleep");
+ 
++        // [本地补丁] 软休眠醒来时屏幕一律点亮，所以要清掉播放熄屏的标记，
++        // 否则它会一直是 true，之后就再也熄不了屏（见 WakeFromIdle 的分支顺序）。
++        playback_screen_off_ = false;
++
+         WakePanel();
+         GetBacklight()->RestoreBrightness();
+ 
+@@ -1030,8 +1538,89 @@ public:
+         InitializeSpi();
+         InitializeDisplay();
+         InitializeButtons();
++        // [本地补丁] 工具必须在 MCPServer 建立之后、设备开始对话之前注册，
++        // 因此放在构造流程里（与其它板子的 InitializeTools 时机一致）。
++        InitializeTools();
+         GetBacklight()->RestoreBrightness();
+         InitializePowerSaveTimer();
++        // [本地补丁] 长音频播放期间的熄屏路径，独立于上面三档闲置省电。
++        InitializePlaybackScreenTimer();
++    }
++
++    // -----------------------------------------------------------------------
++    // [本地补丁] 板级 MCP 工具：网络音频播报
++    //
++    // 复用固件自带的 NotifyPlayer（main/notify/notify_player.cc）：
++    //   HTTP 拉取 -> Ogg 解封装 -> 推入 Opus 解码队列。
++    // 与官方 notify 控制报文走同一条管线，只是触发方式从「服务端下发控制报文」
++    // 改为「模型调用本工具」，因此音频格式约束与 notify 完全一致，必须写进工具
++    // 描述——格式不符时设备不会报错，只是完全没有声音（先响一声提示音再静默）。
++    //
++    // 固件里不存在任何「播某个 URL」的全局工具（全仓 grep play_url 命中 0），
++    // 官方的 notify 入口也只接受服务端下发，所以只能在板级补。
++    //
++    // 采样率必须对齐本板 AUDIO_OUTPUT_SAMPLE_RATE（本板 24000），
++    // 否则 OpusHead 里写的是别的速率，固件需要额外重采样，听感会变慢或变快。
++    // -----------------------------------------------------------------------
++    void InitializeTools() {
++        auto& mcp_server = McpServer::GetInstance();
++        mcp_server.AddTool(
++            "self.audio.play_url",
++            "播放一段网络音频，用于讲故事、播放录制好的语音或音乐片段。"
++            "url 必须是设备能直接下载的【单声道 Ogg Opus（.ogg）】音频直链，"
++            "采样率 24000 Hz：本设备没有 MP3 解码器，也不支持立体声，"
++            "格式不符会完全没有声音。"
++            "播放会打断当前对话，播放期间不能同时对话，播完自动回到待机。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                const auto url = properties["url"].value<std::string>();
++                if (url.empty()) {
++                    return std::unexpected("url 不能为空");
++                }
++                // [图片回显] 故事要用**连续**内存下载，先把全屏图片的像素块还回去。
++                // 放在 PlayAudioUrl 之前，保证故事第一次分配时不与图片争内存。
++                HideImageNow();
++                if (!Application::GetInstance().PlayAudioUrl(url)) {
++                    return std::unexpected("设备当前无法开始播放，请稍后再试");
++                }
++                return std::string("已开始播放音频");
++            });
++
++        // -------------------------------------------------------------------
++        // [本地补丁 · 图片回显] 全屏图片工具
++        //
++        // 为什么只给一个 url 参数、不另外给 base64 的 data：交接文档的实测结论是
++        // 「一个返回里同时带两种数据时，模型会优先用熟悉的那个」，所以这里只留
++        // 一种数据形态，模型没有可错选的对象。
++        //
++        // 为什么不走 https：本板无 PSRAM，TLS 收包要 16,749 字节连续堆，播放/显示中
++        // 必然断流（2026-10-09 实测故事拉到 32 KB 就断）。ShowImageFromUrl 会明确拒绝
++        // https 并说明理由，不让它变成无头案。
++        // -------------------------------------------------------------------
++        mcp_server.AddTool(
++            "self.screen.show_test_pattern",
++            "在设备屏幕上显示一张本机生成的彩色测试图案（不需要联网）。"
++            "用于确认屏幕显示链路是否正常。显示期间屏幕保持常亮，按任意键关闭。",
++            PropertyList(),
++            [this](const PropertyList&) -> ToolResult { return ShowTestPattern(); });
++
++        mcp_server.AddTool(
++            "self.screen.show_image",
++            "把一张图片显示在设备屏幕上。url 必须是以 http:// 开头的直链，"
++            "内容是设备认识的 RGB565 原始像素文件（R5G6B5 格式，约 120x160）。"
++            "设备会把像素直接放进显存，不解码 JPEG/PNG。"
++            "https 地址在本设备上必然失败，不要使用。"
++            "显示期间屏幕保持常亮，按任意键关闭。",
++            PropertyList({Property("url", kPropertyTypeString)}),
++            [this](const PropertyList& properties) -> ToolResult {
++                return ShowImageFromUrl(properties["url"].value<std::string>());
++            });
++
++        mcp_server.AddTool(
++            "self.screen.hide_image",
++            "关闭屏幕上的全屏图片，回到正常的对话界面。按机身任意键也能关闭。",
++            PropertyList(),
++            [this](const PropertyList&) -> ToolResult { return HideImageTool(); });
+     }
+ 
+     virtual AudioCodec* GetAudioCodec() override {
+diff --git a/main/display/display.cc b/main/display/display.cc
+index 7ab9a50..870d3e5 100644
+--- a/main/display/display.cc
++++ b/main/display/display.cc
+@@ -19,6 +19,14 @@ Display::~Display() {}
+ 
+ void Display::SetPreviewImage(std::unique_ptr<LvglImage> image) {}
+ 
++// [本地补丁] 全屏图片层默认实现：不带 GUI 或不支持该层的显示实现返回失败，
++// 调用方据此降级（例如返回「屏幕不支持全屏图片」），而不是静默什么都不做。
++bool Display::ShowFullscreenImage(std::unique_ptr<LvglImage> image, int scale) {
++    (void)image;
++    (void)scale;
++    return false;
++}
++
+ void Display::SetStatus(const char* status) { ESP_LOGW(TAG, "SetStatus: %s", status); }
+ 
+ void Display::ShowNotification(const std::string& notification, int duration_ms) {
+diff --git a/main/display/display.h b/main/display/display.h
+index e7fa6fa..5ba56b5 100644
+--- a/main/display/display.h
++++ b/main/display/display.h
+@@ -75,6 +75,33 @@ public:
+     }
+     virtual void LoadAssets() {}
+     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
++
++    // ------------------------------------------------------------------------
++    // [本地补丁] 全屏图片层（板无关：任何带 LVGL 的显示实现都可用）
++    //
++    // 用途：把一张图片铺满屏幕并**常驻**显示，直到显式隐藏。与官方
++    // SetPreviewImage 的区别：后者 5 秒自动消失、只占屏幕约一半，而且它唯一的
++    // 触发入口 self.screen.preview_image 是 AddUserOnlyTool（模型在 tools/list
++    // 里看不到），所以模型永远调不动。
++    //
++    // 为什么单开一层：无 PSRAM 的板子上，整机只有一块几十 KB 的连续堆，设备侧
++    // 必须做到「下载块就是像素块、零解码、零拷贝」。本层只负责把一块**已经准备
++    // 好的**像素显示出来，不认识 URL、不做网络与解码，因此对 RGB565 原始像素、
++    // PNG 等任何 LvglImage 都通用。
++    //
++    // scale：0 = 自动，按面板尺寸算「保持比例、尽量铺满」的缩放（推荐）；
++    //        256 = 原始大小；512 = 放大 2 倍；非 0 时按调用方给的值。
++    // 返回 false 表示该显示实现不支持（默认实现见 display.cc），调用方据此降级。
++    //
++    // 只声明不内联：参数是 unique_ptr<LvglImage>，实例化其析构需要 LvglImage
++    // 完整类型，而本头文件对它只是前置声明。
++    // ------------------------------------------------------------------------
++    virtual bool ShowFullscreenImage(std::unique_ptr<LvglImage> image, int scale = 0);
++    // 隐藏全屏图片层并释放其持有内容，回到对话界面。重复调用安全。
++    virtual void HideFullscreenImage() {}
++    // 全屏图片层当前是否可见。
++    virtual bool IsFullscreenImageVisible() const { return false; }
++
+     virtual bool SetTextFont(std::shared_ptr<LvglFont> text_font) {
+         (void)text_font;
+         return false;
+diff --git a/main/display/lcd_display.cc b/main/display/lcd_display.cc
+index 3462ac0..aafbd15 100644
+--- a/main/display/lcd_display.cc
++++ b/main/display/lcd_display.cc
+@@ -323,6 +323,7 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
+ 
+ LcdDisplay::~LcdDisplay() {
+     SetPreviewImage(nullptr);
++    DestroyFullscreenImageLocked();
+ 
+     // Clean up GIF controller
+     if (gif_controller_) {
+@@ -1129,6 +1130,128 @@ void LcdDisplay::ClearChatMessages() {
+ }
+ #endif
+ 
++// ============================================================================
++// [本地补丁] 全屏图片层实现
++//
++// 刻意放在两套消息样式（CONFIG_USE_WECHAT_MESSAGE_STYLE 的 #if / #else）之外：
++// 容器挂在 lv_layer_top() 上，天然覆盖整个对话界面，因此改动与 UI 布局无关，
++// 两套样式共用同一份实现。
++//
++// 与旧版（已废弃的看图实现）的两个关键差别：
++//   1) 缩放。旧版只做居中、不缩放，80x80 的源图在 240x320 上只是个缩略图；
++//      这里由 width_/height_ 与源图尺寸算出倍率，120x160 的源图配 512（2 倍）
++//      正好铺满 240x320。
++//   2) 尺寸不写死。倍率是算出来的，所以任何分辨率的板子都自动「保持比例、
++//      尽量铺满、居中留白」，不需要按板配置。
++//
++// 为什么拆成「容器 + 子图像」两个对象：容器负责用不透明浅色底盖住整个对话界面
++// （尺寸 = 面板尺寸），子图像只按源图尺寸摆放、靠 lv_image_set_scale 放大；
++// 容器不设 LV_OBJ_FLAG_OVERFLOW_VISIBLE，子对象超出容器的部分会被裁掉，
++// 于是「盖住 UI」和「放大居中」两件事互不干扰。
++// ============================================================================
++
++void LcdDisplay::DestroyFullscreenImageLocked() {
++    if (fullscreen_image_ != nullptr) {
++        // 删容器会连带删掉子对象，并触发 LV_EVENT_DELETE 回调释放 LvglImage
++        // （其析构函数负责 heap_caps_free 掉像素缓冲），所以这里只需删容器。
++        lv_obj_delete(fullscreen_image_);
++        fullscreen_image_ = nullptr;
++        fullscreen_image_src_ = nullptr;
++    }
++    fullscreen_active_ = false;
++}
++
++bool LcdDisplay::ShowFullscreenImage(std::unique_ptr<LvglImage> image, int scale) {
++    if (image == nullptr) {
++        return false;
++    }
++    const lv_img_dsc_t* dsc = image->image_dsc();
++    if (dsc == nullptr || dsc->header.w == 0 || dsc->header.h == 0) {
++        ESP_LOGE(TAG, "ShowFullscreenImage: invalid image descriptor");
++        return false;
++    }
++    if (width_ <= 0 || height_ <= 0) {
++        ESP_LOGE(TAG, "ShowFullscreenImage: display size unknown");
++        return false;
++    }
++    if (!setup_ui_called_) {
++        ESP_LOGW(TAG, "ShowFullscreenImage called before SetupUI()");
++    }
++
++    // scale == 0 → 自动：保持比例、尽量铺满。两个方向取小的那个，保证不裁内容。
++    if (scale <= 0) {
++        const int by_width = width_ * 256 / static_cast<int>(dsc->header.w);
++        const int by_height = height_ * 256 / static_cast<int>(dsc->header.h);
++        scale = by_width < by_height ? by_width : by_height;
++    }
++    if (scale <= 0) {
++        scale = 256;
++    }
++
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return false;
++    }
++    // 同一时刻只保留一张全屏图：先清掉旧的，避免叠层与内存泄漏。
++    DestroyFullscreenImageLocked();
++
++    lv_obj_t* layer = lv_layer_top();
++    if (layer == nullptr) {
++        ESP_LOGE(TAG, "ShowFullscreenImage: lv_layer_top() is null");
++        return false;
++    }
++
++    lv_obj_t* container = lv_obj_create(layer);
++    lv_obj_remove_flag(container, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_remove_flag(container, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_set_style_pad_all(container, 0, 0);
++    lv_obj_set_style_border_width(container, 0, 0);
++    lv_obj_set_style_outline_width(container, 0, 0);
++    lv_obj_set_style_radius(container, 0, 0);
++    // 浅色底：图片比例与屏幕不一致时，留白处不会透出底下的对话界面。
++    // 不用黑色 —— 240x240 的图放到 240x320 上，黑色上下边会被看成「纯色图」。
++    lv_obj_set_style_bg_color(container, lv_color_hex(0xF4EFE6), 0);
++    lv_obj_set_style_bg_opa(container, LV_OPA_COVER, 0);
++    lv_obj_set_pos(container, 0, 0);
++    lv_obj_set_size(container, width_, height_);
++
++    lv_obj_t* src = lv_image_create(container);
++    lv_image_set_src(src, dsc);
++    lv_image_set_scale(src, scale);
++    lv_obj_center(src);
++
++    // 所有权转交 LVGL 对象：容器被删除时释放 LvglImage（进而释放像素缓冲）。
++    LvglImage* raw_image = image.release();
++    lv_obj_add_event_cb(
++        container,
++        [](lv_event_t* e) {
++            LvglImage* img = static_cast<LvglImage*>(lv_event_get_user_data(e));
++            if (img != nullptr) {
++                delete img;
++            }
++        },
++        LV_EVENT_DELETE, static_cast<void*>(raw_image));
++
++    fullscreen_image_ = container;
++    fullscreen_image_src_ = src;
++    fullscreen_active_ = true;
++    ESP_LOGI(TAG, "Fullscreen image shown: panel %dx%d, source %ldx%ld, scale %d/256", width_,
++             height_, static_cast<long>(dsc->header.w), static_cast<long>(dsc->header.h), scale);
++    return true;
++}
++
++void LcdDisplay::HideFullscreenImage() {
++    DisplayLockGuard lock(this);
++    if (!lock) {
++        return;
++    }
++    if (!fullscreen_active_ && fullscreen_image_ == nullptr) {
++        return;
++    }
++    DestroyFullscreenImageLocked();
++    ESP_LOGI(TAG, "Fullscreen image hidden");
++}
++
+ void LcdDisplay::SetEmotion(const char* emotion) {
+     if (!setup_ui_called_) {
+         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
+diff --git a/main/display/lcd_display.h b/main/display/lcd_display.h
+index 9f963e9..93ad26b 100644
+--- a/main/display/lcd_display.h
++++ b/main/display/lcd_display.h
+@@ -33,6 +33,16 @@ protected:
+     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+ 
++    // [本地补丁] 全屏图片层：容器挂在 lv_layer_top() 上，与对话 UI 布局无关。
++    // 容器负责用不透明浅色底盖住整个对话界面（尺寸 = 面板尺寸），图像是它的子
++    // 对象，按源图尺寸摆放后用 lv_image_set_scale 放大，超出部分由容器裁掉。
++    lv_obj_t* fullscreen_image_ = nullptr;      // 容器
++    lv_obj_t* fullscreen_image_src_ = nullptr;  // 容器里的 lv_image
++    // 按键任务的回调会跨任务读它，因此用原子量（<atomic> 已在本文件头部包含）。
++    std::atomic<bool> fullscreen_active_{false};
++    // 释放全屏图片层。调用方必须已持有 DisplayLockGuard。
++    void DestroyFullscreenImageLocked();
++
+     void InitializeLcdThemes();
+     virtual bool Lock(int timeout_ms = 0) override;
+     virtual void Unlock() override;
+@@ -48,6 +58,9 @@ public:
+     virtual void SetChatMessage(const char* role, const char* content) override;
+     virtual void ClearChatMessages() override;
+     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
++    virtual bool ShowFullscreenImage(std::unique_ptr<LvglImage> image, int scale = 0) override;
++    virtual void HideFullscreenImage() override;
++    virtual bool IsFullscreenImageVisible() const override { return fullscreen_active_; }
+     virtual void SetupUI() override;
+     // Add theme switching function
+     virtual void SetTheme(Theme* theme) override;
+diff --git a/main/notify/notify_player.cc b/main/notify/notify_player.cc
+index 312bc96..fa69080 100644
+--- a/main/notify/notify_player.cc
++++ b/main/notify/notify_player.cc
+@@ -6,13 +6,27 @@
+ #include <memory>
+ 
+ #include <esp_log.h>
++#include <esp_timer.h>
++#include <string>
+ 
+ #include "board.h"
+ #include "http.h"
+ #include "ogg_demuxer.h"
+ 
+ namespace {
+-constexpr int kHttpTimeoutMs = 5000;
++// 这块板在故事播放期间会出现**数秒级的链路中断**（日志里同时能看到
++// `Notification playback underrun`、`mqtt_client: No PING_RESP`、`EspUdp: ... errno=12`）。
++// 5 秒读超时会**直接放弃整集**——这就是「故事放不完」的根因，与固件版本无关。
++// 10 秒：1~10 秒的中断在**同一条连接**上熬过去，不重连、不丢音频（只静音）；
++//       更长的中断交给下面的 Range 续传（见 README §10 第 1 条）。
++constexpr int kHttpTimeoutMs = 10000;
++// 读失败后最多从「已消费字节」处续传几次。每次重连都精确接续，不重播。
++// 续传重试：链路**整体**断掉时（实测同时出现 `Failed to get host by name` /
++// `DNS resolution failed`），第一次重连必然失败——只试一次等于没修。所以按**时间窗**反复重试，
++// 直到链路回来。两个上限同时生效：时间窗 60 秒、次数 20 次。
++constexpr int kResumeWindowMs = 60000;
++constexpr int kResumeRetryDelayMs = 1500;
++constexpr int kMaxResumeAttempts = 20;
+ constexpr size_t kHttpReadBufferSize = 1024;
+ constexpr uint32_t kNotifyTaskStackSize = 6144;
+ constexpr UBaseType_t kNotifyTaskPriority = 2;
+@@ -228,24 +242,107 @@ void NotifyPlayer::WorkerTask() {
+                         media_position_ms += frame_duration_ms;
+                     });
+ 
++                // 续传的**正确性依据**（2026-10-10 在本机用真实 ogg 文件逐字节验证过）：
++                //   · `Process()` 的返回值是「它已接手并消化掉的字节数」，Range 起点必须用它，
++                //     **不能用「已收到字节数」**——实测偏移差 100 字节就会 has_error 且 Finish 失败；
++                //   · **不能 `Reset()` demuxer**：会丢掉 OpusHead/OpusTags，之后每一包都被丢弃
++                //     （实测：重置后续传，包数停在中断处、Finish 失败）；
++                //   · 从正确的 consumed 处续传，得到的包序列与「一次读完整文件」**完全一致**。
++                // Content-Length：用来区分「正常收完」与「服务端提前关闭」——后者也是
++                // `Connection closed prematurely` 的来源，同样应该续传而不是判失败。
++                const size_t expected_bytes = http->GetBodyLength();
++                size_t received_bytes = 0;
++                size_t consumed_bytes = 0;
++                int resume_attempts_left = kMaxResumeAttempts;
+                 std::array<char, kHttpReadBufferSize> buffer;
+                 while (!packet_error && !IsCancelled(playback_id)) {
++                    const int64_t read_started_us = esp_timer_get_time();
+                     auto size = http->Read(buffer.data(), buffer.size());
+-                    if (!size) {
+-                        ESP_LOGE(TAG, "Notification HTTP read failed: %s",
+-                                 size.error().ToString().c_str());
+-                        break;
++                    const int64_t read_ms = (esp_timer_get_time() - read_started_us) / 1000;
++                    if (read_ms >= 1000) {
++                        // 只在真卡住时打：这几行就是「链路抖动到底有多长」的实测数据
++                        ESP_LOGW(TAG, "Notification read stalled %lld ms (received %u, consumed %u)",
++                                 static_cast<long long>(read_ms),
++                                 static_cast<unsigned>(received_bytes),
++                                 static_cast<unsigned>(consumed_bytes));
+                     }
+-                    if (*size == 0) {
+-                        success = demuxer->Finish();
+-                        if (!success) {
+-                            ESP_LOGE(
+-                                TAG,
+-                                "Notification Ogg stream ended before a complete audio stream");
++                    if (!size || *size == 0) {
++                        // 正常收完 = 已收到字节数达到 Content-Length（长度未知时不判定提前结束）。
++                        const bool stream_incomplete =
++                            !size || (expected_bytes > 0 && received_bytes < expected_bytes);
++                        if (!size) {
++                            ESP_LOGE(TAG, "Notification HTTP read failed: %s",
++                                     size.error().ToString().c_str());
++                        } else if (stream_incomplete) {
++                            ESP_LOGW(TAG, "Notification stream closed early: %u of %u bytes",
++                                     static_cast<unsigned>(received_bytes),
++                                     static_cast<unsigned>(expected_bytes));
++                        }
++                        // 先试着续传（带退避重试）；只有 http:// 才续（本板 https 收包必然断流）。
++                        bool resumed_ok = false;
++                        int resume_attempts = 0;
++                        const int64_t stall_started_us = esp_timer_get_time();
++                        while (!resumed_ok && stream_incomplete &&
++                               resume_attempts < kMaxResumeAttempts &&
++                               (esp_timer_get_time() - stall_started_us) / 1000 < kResumeWindowMs &&
++                               consumed_bytes > 0 && !IsCancelled(playback_id) &&
++                               audio_url.compare(0, 7, "http://") == 0) {
++                            ++resume_attempts;
++                            auto resumed = Board::GetInstance().GetNetwork()->CreateHttp(0);
++                            int status_code = -1;
++                            if (resumed) {
++                                resumed->SetTimeout(kHttpTimeoutMs);
++                                resumed->SetHeader("Accept", "audio/ogg, application/ogg");
++                                resumed->SetHeader("Accept-Encoding", "identity");
++                                resumed->SetHeader("Range",
++                                                   "bytes=" + std::to_string(consumed_bytes) + "-");
++                                if (auto opened = resumed->Open("GET", audio_url); opened) {
++                                    auto status = resumed->GetStatusCode();
++                                    status_code = status ? *status : -1;
++                                    // 必须 206。若服务端忽略 Range 回 200（整个文件），从头喂
++                                    // 会让故事**从头重播**，比失败更糟，所以宁可不续。
++                                    resumed_ok = status_code == 206;
++                                }
++                            }
++                            if (resumed_ok) {
++                                http->Close();
++                                http = std::move(resumed);
++                                ESP_LOGW(TAG,
++                                         "Notification resumed at byte %u (attempt %d, %lld ms after the stall began)",
++                                         static_cast<unsigned>(consumed_bytes), resume_attempts,
++                                         static_cast<long long>((esp_timer_get_time() -
++                                                                 stall_started_us) / 1000));
++                            } else {
++                                // 失败原因必须打出来：本板实测这里多为 DNS/建连失败（链路整体断）
++                                ESP_LOGW(TAG,
++                                         "Notification resume attempt %d failed (status %d); retry in %d ms",
++                                         resume_attempts, status_code, kResumeRetryDelayMs);
++                                vTaskDelay(pdMS_TO_TICKS(kResumeRetryDelayMs));
++                            }
++                        }
++                        if (resumed_ok) {
++                            continue;
++                        }
++                        if (resume_attempts > 0) {
++                            ESP_LOGE(TAG,
++                                     "Notification gave up resuming after %d attempts / %lld ms",
++                                     resume_attempts,
++                                     static_cast<long long>((esp_timer_get_time() -
++                                                             stall_started_us) / 1000));
++                        }
++                        if (!stream_incomplete) {
++                            success = demuxer->Finish();
++                            if (!success) {
++                                ESP_LOGE(
++                                    TAG,
++                                    "Notification Ogg stream ended before a complete audio stream");
++                            }
+                         }
+                         break;
+                     }
+-                    demuxer->Process(reinterpret_cast<const uint8_t*>(buffer.data()), *size);
++                    received_bytes += *size;
++                    consumed_bytes += demuxer->Process(
++                        reinterpret_cast<const uint8_t*>(buffer.data()), *size);
+                     if (demuxer->HasError()) {
+                         packet_error = true;
+                     }
+diff --git a/main/system_info.cc b/main/system_info.cc
+index c4a6077..5c6cd76 100644
+--- a/main/system_info.cc
++++ b/main/system_info.cc
+@@ -150,7 +150,13 @@ void SystemInfo::PrintTaskList() {
+ void SystemInfo::PrintHeapStats() {
+     int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+     int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
++    // [本地补丁] 顺带打印最大空闲块。只看「还剩多少」会误导：2026-10-09 实测
++    // 故事下载失败时 free sram 还有 75 KB，却要不到一块连续的 16 KB（TLS 收包缓冲），
++    // 麦克风上行 UDP 也在堆只剩 ~36 KB 时报过 errno=12(ENOMEM)。
++    // 这两类都是「要连续块要不到」，只有 largest block 能看出碎片程度。
++    int largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
++    ESP_LOGI(TAG, "free sram: %u minimal sram: %u largest block: %u", free_sram, min_free_sram,
++             largest_block);
+ }
+ 
+ void SystemInfo::PrintPmLocks() {
+-- 
+2.50.1 (Apple Git-155)
+
